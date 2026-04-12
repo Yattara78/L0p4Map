@@ -1,17 +1,20 @@
+from __future__ import annotations
+
 import ipaddress
 import socket
 import psutil
 import requests
 import csv as _csv
-from scapy.all import ARP, Ether, srp, sniff, IP as ScapyIP, TCP,UDP
+from typing import Optional, List, Dict, Union
+from scapy.all import ARP, Ether, srp, sniff, IP as ScapyIP, TCP, UDP
 import os
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 
-_vendor_cache: dict[str, str] = {}
-_oui_db: dict[str, str] = {}
+_vendor_cache = {}
+_oui_db = {}
 
-def capture_traffic(iface: str, duration: int = 15) -> list[dict]:
+def capture_traffic(iface: str, duration: int = 15) -> List[dict]:
     connections = defaultdict(lambda: {"packets": 0, "bytes": 0, "proto": "OTHER", "port": "-"})
 
     def process(pkt):
@@ -47,7 +50,7 @@ def capture_traffic(iface: str, duration: int = 15) -> list[dict]:
             "bytes": data["bytes"],
             "proto": data["proto"],
             "port": data["port"],
-            "weight":min(data["packets"] /10, 10)
+            "weight": min(data["packets"] / 10, 10)
         })
 
     return sorted(edges, key=lambda e: e["packets"], reverse=True)
@@ -87,7 +90,7 @@ def check_root():
     if os.getuid() != 0:
         raise PermissionError("Execute the program with SUDO!")
 
-def get_local_subnet(iface_name=None) -> str:
+def get_local_subnet(iface_name: Optional[str] = None) -> str:
     interfaces = psutil.net_if_addrs()
     stats = psutil.net_if_stats()
     if iface_name:
@@ -125,7 +128,7 @@ def get_vendor(mac: str) -> str:
     _vendor_cache[oui] = "Unknown"
     return "Unknown"
 
-def _dns_hostname(ip: str) -> str | None:
+def _dns_hostname(ip: str) -> Optional[str]:
     try:
         name = socket.gethostbyaddr(ip)[0]
         if name and name != ip:
@@ -134,7 +137,7 @@ def _dns_hostname(ip: str) -> str | None:
         pass
     return None
 
-def _netbios_hostname(ip: str) -> str | None:
+def _netbios_hostname(ip: str) -> Optional[str]:
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(1)
@@ -155,7 +158,7 @@ def _netbios_hostname(ip: str) -> str | None:
         pass
     return None
 
-def _mdns_hostname(ip: str) -> str | None:
+def _mdns_hostname(ip: str) -> Optional[str]:
     try:
         reversed_ip = ".".join(reversed(ip.split(".")))
         ptr = f"{reversed_ip}.in-addr.arpa"
@@ -189,9 +192,9 @@ def resolve_hostname(ip: str) -> str:
         return name
     return ip
 
-def scan_network(subnet: str) -> list[dict]:
+def scan_network(subnet: str) -> List[Dict]:
     pacchetto = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=subnet)
-    risposte, _ = srp(pacchetto, timeout=2, retry=2, inter=0.01 ,verbose=False)
+    risposte, _ = srp(pacchetto, timeout=2, retry=2, inter=0.01, verbose=False)
 
     seen_macs = {}
     for _, risposta in risposte:
@@ -217,5 +220,4 @@ def scan_network(subnet: str) -> list[dict]:
     with ThreadPoolExecutor(max_workers=20) as executor:
         results = list(executor.map(enrich, hosts))
 
-    results.sort(key=lambda h: [int(x) for x in h["ip"].split(".")])
     return results
