@@ -1,0 +1,10 @@
+scapy
+requests
+psutil
+PyQt6
+PyQt6-WebEngine
+dnspython
+cryptography
+
+pytest
+python-nmap
