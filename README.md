@@ -79,11 +79,15 @@ No bloat. No BS. Just raw network intelligence.
 ---
 
 ## Installation
+
+### Quick Start (Recommended)
 ```bash
-git clone https://github.com/HaxL0p4/L0p4Map.git
+git clone https://github.com/Yattara78/L0p4Map.git
 cd L0p4Map
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-sudo chmod +x L0p4Map.sh
+python ui/app.py
 ```
 
 ---
