@@ -305,12 +305,19 @@ class Inventory:
         row = self.conn.execute("SELECT mac FROM devices WHERE mac=?", (mac,)).fetchone()
         if row is None:
             return False
-        updates = {"label": label, "grp": group, "notes": notes}
-        for column, value in updates.items():
-            if value is not None:
-                self.conn.execute(
-                    f"UPDATE devices SET {column} = ? WHERE mac = ?", (value, mac)
-                )
+        # Explicit statements: no column name ever reaches the SQL string.
+        if label is not None:
+            self.conn.execute(
+                "UPDATE devices SET label = ? WHERE mac = ?", (label, mac)
+            )
+        if group is not None:
+            self.conn.execute(
+                "UPDATE devices SET grp = ? WHERE mac = ?", (group, mac)
+            )
+        if notes is not None:
+            self.conn.execute(
+                "UPDATE devices SET notes = ? WHERE mac = ?", (notes, mac)
+            )
         self.conn.commit()
         return True
 
