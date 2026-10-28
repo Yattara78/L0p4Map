@@ -40,6 +40,11 @@ setup_python() {
         say "Creating virtualenv in .venv ..."
         python3 -m venv "$VENV" || fail "python3 -m venv failed (Python 3.11+ required)"
     fi
+    # Skip the (slow, network-bound) install when everything already imports:
+    # it also keeps a sudo run from writing root-owned files into .venv.
+    if "$PY" -c "import PyQt6.QtWebEngineWidgets, scapy, psutil, requests, dns, cryptography" >/dev/null 2>&1; then
+        return 0
+    fi
     "$PY" -m pip install --quiet --upgrade pip
     "$PY" -m pip install --quiet -r "$REPO_DIR/requirements.txt" \
         || fail "dependency installation failed"
@@ -106,7 +111,7 @@ PYCODE
 
 report_privileges() {
     if [ "$(id -u)" -eq 0 ]; then
-        warn "running as root: the GUI and its embedded browser run privileged"
+        say "Running as root — full ARP discovery and packet capture enabled."
         return 0
     fi
     if raw_sockets_available; then
