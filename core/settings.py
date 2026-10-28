@@ -12,7 +12,55 @@ import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
-CONFIG_DIR = Path(os.environ.get("L0P4MAP_CONFIG_DIR") or (Path.home() / ".l0p4map"))
+try:  # Unix only
+    import pwd
+except ImportError:  # pragma: no cover - Windows
+    pwd = None  # type: ignore[assignment]
+
+
+def user_home() -> Path:
+    """Home of the invoking user, even when the GUI runs through sudo.
+
+    The launcher starts the app with `sudo -E`, so HOME would be /var/root and
+    the GUI would silently build a second inventory that the CLI never sees.
+    """
+    if os.geteuid() == 0:
+        sudo_user = os.environ.get("SUDO_USER")
+        if sudo_user and pwd is not None:
+            try:
+                return Path(pwd.getpwnam(sudo_user).pw_dir)
+            except KeyError:
+                pass
+    return Path.home()
+
+
+def _invoking_owner() -> Optional[tuple[int, int]]:
+    if os.geteuid() != 0:
+        return None
+    sudo_user = os.environ.get("SUDO_USER")
+    if not sudo_user or pwd is None:
+        return None
+    try:
+        entry = pwd.getpwnam(sudo_user)
+    except KeyError:
+        return None
+    return entry.pw_uid, entry.pw_gid
+
+
+def fix_ownership(path: str | Path) -> None:
+    """Give files created as root back to the invoking user (best effort)."""
+    owner = _invoking_owner()
+    if owner is None:
+        return
+    try:
+        os.chown(Path(path), *owner)
+    except OSError:
+        pass
+
+
+CONFIG_DIR = Path(
+    os.environ.get("L0P4MAP_CONFIG_DIR") or (user_home() / ".l0p4map")
+)
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -77,6 +125,8 @@ def save(config: dict, path: Optional[str | Path] = None) -> Path:
         os.chmod(target, 0o600)  # may hold API tokens / SMTP password
     except OSError:
         pass
+    fix_ownership(target)
+    fix_ownership(target.parent)
     return target
 
 

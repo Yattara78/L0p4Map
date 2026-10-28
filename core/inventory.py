@@ -14,8 +14,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
+from core import settings
+
 DEFAULT_DB_PATH = Path(
-    os.environ.get("L0P4MAP_DB") or (Path.home() / ".l0p4map" / "inventory.db")
+    os.environ.get("L0P4MAP_DB")
+    or (settings.user_home() / ".l0p4map" / "inventory.db")
 )
 
 SCHEMA = """
@@ -139,6 +142,9 @@ class Inventory:
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
         self.conn.commit()
+        # When the GUI runs through sudo, keep the DB usable by the real user
+        settings.fix_ownership(self.path)
+        settings.fix_ownership(self.path.parent)
 
     # -- lifecycle -----------------------------------------------------
     def close(self) -> None:
