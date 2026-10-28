@@ -16,7 +16,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from core import alerts, report, settings  # noqa: E402
+from core import alerts, report, risks, settings  # noqa: E402
+from core import toolbox  # noqa: E402
 from core.inventory import DEFAULT_DB_PATH, Inventory  # noqa: E402
 from core.scheduler import Schedule  # noqa: E402
 
@@ -183,6 +184,81 @@ def cmd_report(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_subnet(args: argparse.Namespace) -> int:
+    try:
+        info = toolbox.subnet_info(args.cidr)
+    except ValueError as exc:
+        print(f"réseau invalide: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    if args.json:
+        print(json.dumps(info, indent=2))
+        return EXIT_OK
+    for key, value in info.items():
+        print(f"{key:16} {value}")
+    return EXIT_OK
+
+
+def cmd_dns(args: argparse.Namespace) -> int:
+    result = toolbox.dns_lookup(args.name)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return EXIT_OK
+    print(f"{result['name']}:")
+    for record_type, values in result["records"].items():
+        print(f"  {record_type:5} {', '.join(values) if values else '—'}")
+    if result["error"]:
+        print(f"  erreur: {result['error']}", file=sys.stderr)
+    return EXIT_OK
+
+
+def cmd_headers(args: argparse.Namespace) -> int:
+    result = toolbox.http_headers(args.url)
+    if args.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return EXIT_OK
+    if result["error"]:
+        print(f"erreur: {result['error']}", file=sys.stderr)
+        return EXIT_ERROR
+    print(f"HTTP {result['status']}  {result['url']}")
+    for key, value in result["headers"].items():
+        print(f"  {key}: {value}")
+    return EXIT_OK
+
+
+def cmd_priority(args: argparse.Namespace) -> int:
+    if args.cve:
+        cves = []
+        for entry in args.cve:
+            cve_id, _, cvss_text = entry.partition(":")
+            try:
+                cvss = float(cvss_text) if cvss_text else (args.cvss or 0.0)
+            except ValueError:
+                print(f"CVSS invalide dans {entry!r}", file=sys.stderr)
+                return EXIT_ERROR
+            cves.append({"id": cve_id.strip(), "cvss": cvss})
+    elif args.from_json:
+        try:
+            cves = json.loads(Path(args.from_json).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"lecture impossible: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+    else:
+        print("fournir --cve CVE-... (répétable) ou --from-json fichier", file=sys.stderr)
+        return EXIT_ERROR
+
+    rows = risks.enrich(cves)
+    if args.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return EXIT_OK
+    table = [
+        [r["id"], r.get("host", "-"), f"{float(r.get('cvss') or 0):.1f}",
+         f"{r['epss'] * 100:.0f}%", "oui" if r["kev"] else "-", f"{r['priority']:.2f}"]
+        for r in rows
+    ]
+    _print_table(table, ["CVE", "HOTE", "CVSS", "EPSS", "KEV", "PRIORITE"])
+    return EXIT_OK
+
+
 def cmd_schedule(args: argparse.Namespace) -> int:
     schedule = Schedule.load()
     if args.every:
@@ -251,6 +327,28 @@ def build_parser() -> argparse.ArgumentParser:
     report_cmd.add_argument("--format", choices=["pdf", "html"], default="pdf")
     report_cmd.add_argument("--subnet", help="libellé du réseau dans le rapport")
     report_cmd.set_defaults(func=cmd_report)
+
+    subnet_cmd = sub.add_parser("subnet", help="calcul de sous-réseau")
+    subnet_cmd.add_argument("cidr")
+    subnet_cmd.add_argument("--json", action="store_true")
+    subnet_cmd.set_defaults(func=cmd_subnet)
+
+    dns_cmd = sub.add_parser("dns", help="requêtes DNS (A/AAAA/MX/NS/TXT)")
+    dns_cmd.add_argument("name")
+    dns_cmd.add_argument("--json", action="store_true")
+    dns_cmd.set_defaults(func=cmd_dns)
+
+    headers_cmd = sub.add_parser("headers", help="statut et en-têtes HTTP")
+    headers_cmd.add_argument("url")
+    headers_cmd.add_argument("--json", action="store_true")
+    headers_cmd.set_defaults(func=cmd_headers)
+
+    prio = sub.add_parser("priority", help="prioriser des CVE (EPSS + CISA KEV)")
+    prio.add_argument("--cve", action="append", help="CVE à évaluer, format CVE-XXXX-N[:CVSS] (répétable)")
+    prio.add_argument("--cvss", type=float, default=0.0, help="CVSS des --cve fournis")
+    prio.add_argument("--from-json", help="fichier JSON [{id, cvss, host}]")
+    prio.add_argument("--json", action="store_true")
+    prio.set_defaults(func=cmd_priority)
 
     sched = sub.add_parser("schedule", help="planifier les scans")
     sched.add_argument("--every", type=int, metavar="MIN", help="toutes les N minutes")

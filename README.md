@@ -52,6 +52,8 @@ No bloat. No BS. Just raw network intelligence.
 - **Device labels and groups** — right-click a device to name it, assign a group and keep notes; the label follows the device by MAC.
 - **Client report** — one click produces a PDF (or HTML) with the inventory, exposure findings and CVE list.
 - **Headless CLI** — `./l0p4map.py scan|inventory|label|events|schedule|report`, JSON output, no Qt needed (usable from cron or SSH).
+- **Network toolbox** — subnet calculator, DNS lookup (A/AAAA/MX/NS/TXT), HTTP header check and a quick port probe, from the ⋯ menu or the CLI.
+- **CVE prioritisation** — ranks the CVE list of the Attack Surface page with the FIRST EPSS score and the CISA KEV catalogue, cached locally (12 h / 24 h).
 
 ## 🚧 Upcoming Features
 
@@ -130,6 +132,10 @@ No Qt, no GUI — useful from cron, a jump host or a mini-PC:
 ./l0p4map.py schedule --every 60             # every hour
 ./l0p4map.py schedule --daily 08:00
 ./l0p4map.py report --format pdf --out audit.pdf --subnet 192.168.1.0/24
+./l0p4map.py subnet 192.168.1.0/24           # network/broadcast/usable hosts
+./l0p4map.py dns github.com                  # A/AAAA/MX/NS/TXT
+./l0p4map.py headers https://github.com      # status + headers
+./l0p4map.py priority --cve CVE-2019-0708:9.8 --cve CVE-2017-0144:8.1
 ```
 
 Alerts and schedule live in `~/.l0p4map/config.json` (mode 600); the inventory is

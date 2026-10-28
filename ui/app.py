@@ -29,7 +29,7 @@ from core.scanner import (
 from core.validation import InvalidFlags, is_valid_target, sanitize_custom_flags
 from core.inventory import Inventory
 from core.scheduler import Schedule
-from core import alerts, report
+from core import alerts, report, risks, toolbox
 try:
     from core.scanners import (
         tcp_connect_scan, http_probe, get_ssl_info,
@@ -805,6 +805,9 @@ class MainWindow(QMainWindow):
         tools_menu = QMenu(self)
         tools_menu.addAction("Rapport PDF…", self._generate_report)
         tools_menu.addAction("Inventaire CSV…", self._export_inventory_csv)
+        tools_menu.addSeparator()
+        tools_menu.addAction("Outils réseau…", self._open_tools_dialog)
+        tools_menu.addAction("Prioriser les CVE (EPSS/KEV)…", self._prioritise_cves)
         tools_menu.addSeparator()
         tools_menu.addAction("Planification…", self._open_schedule_dialog)
         tools_menu.addAction("Alertes…", self._open_alerts_dialog)
@@ -2522,6 +2525,147 @@ class MainWindow(QMainWindow):
                     f"nouveaux ports sur {host}: {new_ports}", 12000
                 )
             return
+
+    def _open_tools_dialog(self):
+        """Subnet calculator, DNS lookup and HTTP header check in one window."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Outils réseau")
+        dialog.resize(680, 460)
+        layout = QVBoxLayout(dialog)
+
+        row = QHBoxLayout()
+        tool = QComboBox()
+        tool.addItem("Calcul de sous-réseau", "subnet")
+        tool.addItem("DNS", "dns")
+        tool.addItem("En-têtes HTTP", "headers")
+        entry = QLineEdit()
+        entry.setText(self._current_subnet() or "192.168.1.0/24")
+        run = QPushButton("[ GO ]")
+        run.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        row.addWidget(tool)
+        row.addWidget(entry, stretch=1)
+        row.addWidget(run)
+
+        output = QTextEdit()
+        output.setReadOnly(True)
+        output.setStyleSheet("font-family: 'JetBrains Mono', monospace; font-size: 11px;")
+
+        layout.addLayout(row)
+        layout.addWidget(output, stretch=1)
+
+        placeholders = {
+            "subnet": "192.168.1.0/24",
+            "dns": "example.com",
+            "headers": "https://example.com",
+        }
+
+        def sync_placeholder():
+            entry.setPlaceholderText(placeholders.get(tool.currentData(), ""))
+            entry.setText(placeholders.get(tool.currentData(), ""))
+
+        def go():
+            kind = tool.currentData()
+            value = entry.text().strip()
+            if not value:
+                return
+            output.setPlainText("…")
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                if kind == "subnet":
+                    info = toolbox.subnet_info(value)
+                    output.setPlainText(
+                        "\n".join(f"{key:18} {val}" for key, val in info.items())
+                    )
+                elif kind == "dns":
+                    data = toolbox.dns_lookup(value)
+                    lines = [
+                        f"{rtype:6} {', '.join(values) if values else '—'}"
+                        for rtype, values in data["records"].items()
+                    ]
+                    if data["error"]:
+                        lines.append(f"\nerreur: {data['error']}")
+                    output.setPlainText("\n".join(lines))
+                else:
+                    data = toolbox.http_headers(value)
+                    if data["error"]:
+                        output.setPlainText(f"erreur: {data['error']}")
+                    else:
+                        lines = [f"HTTP {data['status']}  {data['url']}", ""]
+                        lines += [f"{k}: {v}" for k, v in data["headers"].items()]
+                        output.setPlainText("\n".join(lines))
+            except ValueError as exc:
+                output.setPlainText(f"erreur: {exc}")
+            finally:
+                QApplication.restoreOverrideCursor()
+
+        tool.currentIndexChanged.connect(sync_placeholder)
+        run.clicked.connect(go)
+        entry.returnPressed.connect(go)
+        dialog.exec()
+
+    def _prioritise_cves(self):
+        """Rank the CVE list from the Attack Surface page with EPSS + KEV."""
+        results = getattr(self, "_as_results", None) or {}
+        cves: list[dict] = []
+        for target, result in results.items():
+            for cve in result.get("cves", []):
+                entry = dict(cve)
+                entry.setdefault("host", target)
+                cves.append(entry)
+
+        if not cves:
+            QMessageBox.information(
+                self, "Priorisation CVE",
+                "Aucune CVE en mémoire : lance d'abord une analyse dans l'onglet "
+                "Attack Surface (nmap --script vulners).",
+            )
+            return
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            rows = risks.enrich(cves)
+        except Exception as exc:  # noqa: BLE001 - network/parse boundary
+            QMessageBox.warning(self, "Priorisation CVE", f"échec: {exc}")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"CVE prioritaires — {len(rows)} entrées (EPSS + CISA KEV)")
+        dialog.resize(820, 440)
+        layout = QVBoxLayout(dialog)
+        table = QTableWidget(len(rows), 6)
+        table.setHorizontalHeaderLabels(
+            ["CVE", "Hôte", "CVSS", "EPSS", "KEV", "Priorité"]
+        )
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+
+        for row_index, row in enumerate(rows):
+            values = [
+                row["id"],
+                str(row.get("host", "")),
+                f"{float(row.get('cvss') or 0):.1f}",
+                f"{row['epss'] * 100:.0f}%",
+                "OUI" if row["kev"] else "—",
+                f"{row['priority']:.2f}",
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 4 and row["kev"]:
+                    item.setForeground(QColor("#ff4444"))
+                if column == 5:
+                    item.setForeground(QColor("#00ff99"))
+                table.setItem(row_index, column, item)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(table, stretch=1)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     def _populate_table(self, hosts):
         for d in hosts:
