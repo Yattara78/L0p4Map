@@ -2,12 +2,13 @@
 # L0p4Map launcher: checks dependencies, keeps the checkout up to date and
 # starts the GUI with the least privilege that still allows raw sockets.
 #
-#   ./L0p4Map.sh          install deps, update, then launch (unprivileged)
-#   ./L0p4Map.sh --sudo   launch with sudo for ARP discovery and capture
+#   ./L0p4Map.sh          install deps, update, launch with sudo (full capture)
+#   ./L0p4Map.sh --no-sudo launch unprivileged (ARP + capture disabled)
 #   ./L0p4Map.sh --check  verify the environment only, do not launch
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_PATH="$REPO_DIR/$(basename "$0")"
 BRANCH="main"
 VENV="$REPO_DIR/.venv"
 PY="$VENV/bin/python"
@@ -47,18 +48,30 @@ setup_python() {
 update_repo() {
     cd "$REPO_DIR"
     git rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+
+    local current
+    current=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) || return 0
+    if [ "$current" != "$BRANCH" ]; then
+        say "On branch '$current', skipping auto-update of '$BRANCH'."
+        return 0
+    fi
+    if [ -n "$(git status --porcelain)" ]; then
+        say "Local changes present, skipping auto-update."
+        return 0
+    fi
+
     git fetch --quiet origin "$BRANCH" || { warn "git fetch failed, keeping local copy"; return 0; }
     local local_sha remote_sha
     local_sha=$(git rev-parse HEAD)
     remote_sha=$(git rev-parse "origin/$BRANCH" 2>/dev/null) || return 0
     if [ "$local_sha" != "$remote_sha" ]; then
         say "Update found, pulling latest changes..."
-        git pull --quiet origin "$BRANCH" || { warn "git pull failed, keeping local copy"; return 0; }
+        git pull --quiet --ff-only origin "$BRANCH" || { warn "git pull failed, keeping local copy"; return 0; }
         if [ "${L0P4MAP_REEXEC:-0}" = "1" ]; then
             return 0
         fi
         say "Updated, restarting with the new version."
-        L0P4MAP_REEXEC=1 exec "$0" "$@"
+        L0P4MAP_REEXEC=1 exec bash "$SCRIPT_PATH" "$@"
     fi
 }
 
@@ -105,13 +118,14 @@ report_privileges() {
     fi
     warn "no raw-socket access: ARP scan and packet capture will fail."
     warn "fix once with: sudo setcap cap_net_raw,cap_net_admin+eip $(readlink -f "$PY" 2>/dev/null || echo "$PY")"
-    warn "on macOS the same features require: sudo python3 ui/app.py"
+    warn "on macOS the same features require: ./L0p4Map.sh (launches with sudo)"
 }
 
 main() {
-    local check_only=0 want_sudo=0
+    local check_only=0 want_sudo=1
     case "${1:-}" in
         --check) check_only=1 ;;
+        --no-sudo) want_sudo=0 ;;
         --sudo) want_sudo=1 ;;
         -h|--help)
             sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
@@ -128,19 +142,18 @@ main() {
     fi
     say "Dependencies OK ($(nmap --version 2>/dev/null | head -1))"
 
-    report_privileges
-
     if [ "$check_only" -eq 1 ]; then
+        report_privileges
         say "Check complete, not launching."
         exit 0
     fi
-
     cd "$REPO_DIR"
-    if [ "$want_sudo" -eq 1 ] && [ "$(id -u)" -ne 0 ]; then
-        say "Starting with sudo so ARP discovery and packet capture work..."
+    if [ "$want_sudo" -eq 1 ] && [ "$(id -u)" -ne 0 ] && ! raw_sockets_available; then
+        say "Starting with sudo for full ARP discovery and packet capture..."
         exec sudo -E "$PY" ui/app.py
     fi
     # Unprivileged mode is fully supported: only ARP/capture are disabled.
+    report_privileges
     exec "$PY" ui/app.py
 }
 
