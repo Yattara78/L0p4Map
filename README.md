@@ -43,6 +43,16 @@ No bloat. No BS. Just raw network intelligence.
 - **Custom Node Labels** — assign custom names to devices directly from the graph
 - **Attack surface Result Download** — save full output to `.csv` via native file manager dialog *(`.pdf` soon!)*
 
+## Inventory, alerts and reports
+
+- **Persistent inventory (SQLite)** — every scan lands in `~/.l0p4map/inventory.db`: first/last seen, open ports, labels, groups and notes survive restarts.
+- **Scan diff** — the app reports what changed since the previous scan: new devices, devices that disappeared, IP moves and newly opened ports.
+- **Alerts** — desktop notification, Telegram bot, generic webhook (Slack / Discord / n8n) or SMTP email when something changes.
+- **Scheduled scans** — every N minutes or daily at HH:MM, configurable from the toolbar menu or the CLI.
+- **Device labels and groups** — right-click a device to name it, assign a group and keep notes; the label follows the device by MAC.
+- **Client report** — one click produces a PDF (or HTML) with the inventory, exposure findings and CVE list.
+- **Headless CLI** — `./l0p4map.py scan|inventory|label|events|schedule|report`, JSON output, no Qt needed (usable from cron or SSH).
+
 ## 🚧 Upcoming Features
 
 - **CVE Links opening** — fix opening of CVE links
@@ -71,10 +81,10 @@ No bloat. No BS. Just raw network intelligence.
 
 ## Requirements
 
-- Linux (Debian or Arch)
+- Linux (Debian or Arch) or macOS
 - Python 3.11+
-- nmap installed (`sudo pacman -S nmap` or `sudo apt install nmap`)
-- Root privileges (required for ARP scanning)
+- nmap installed (`sudo pacman -S nmap`, `sudo apt install nmap` or `brew install nmap`)
+- Root or `CAP_NET_RAW` for ARP discovery and packet capture — everything else (nmap scans, reports, CLI inventory) runs unprivileged
 
 ---
 
@@ -106,6 +116,25 @@ sudo ./L0p4Map.sh
 5. Select scan options and press **[ RUN SCAN ]** — export results with **[ EXPORT SCAN ]**
 6. Switch to the graph view to explore the network topology — export as CSV or PNG
 7. Enable **[ LIVE ]** to keep the graph updated automatically
+8. Right-click a device to label it, then use the **⋯** menu for the PDF report, the inventory CSV, alerts and scheduling
+
+### Command line
+
+No Qt, no GUI — useful from cron, a jump host or a mini-PC:
+
+```bash
+./l0p4map.py scan --json                     # ARP scan + inventory update
+./l0p4map.py inventory                       # known devices
+./l0p4map.py label aa:bb:cc:00:00:01 --label "NAS" --group "Serveurs"
+./l0p4map.py events --limit 20               # new devices, new ports, IP moves
+./l0p4map.py schedule --every 60             # every hour
+./l0p4map.py schedule --daily 08:00
+./l0p4map.py report --format pdf --out audit.pdf --subnet 192.168.1.0/24
+```
+
+Alerts and schedule live in `~/.l0p4map/config.json` (mode 600); the inventory is
+`~/.l0p4map/inventory.db`. Both are shared by the GUI and the CLI. Override with
+`L0P4MAP_DB` / `L0P4MAP_CONFIG_DIR`.
 
 ---
 

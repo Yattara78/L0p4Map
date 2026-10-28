@@ -5,3 +5,4 @@ PyQt6>=6.6
 PyQt6-WebEngine>=6.6
 dnspython>=2.4
 cryptography>=41
+reportlab>=4

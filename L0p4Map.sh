@@ -42,7 +42,7 @@ setup_python() {
     fi
     # Skip the (slow, network-bound) install when everything already imports:
     # it also keeps a sudo run from writing root-owned files into .venv.
-    if "$PY" -c "import PyQt6.QtWebEngineWidgets, scapy, psutil, requests, dns, cryptography" >/dev/null 2>&1; then
+    if "$PY" -c "import PyQt6.QtWebEngineWidgets, scapy, psutil, requests, dns, cryptography, reportlab" >/dev/null 2>&1; then
         return 0
     fi
     "$PY" -m pip install --quiet --upgrade pip

@@ -5,7 +5,9 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QTableWidget,
     QTableWidgetItem, QHeaderView, QTextEdit,
     QComboBox, QStackedWidget, QCheckBox, QLineEdit, QScrollArea,
-    QFileDialog, QSplashScreen, QMenu, QProgressBar
+    QFileDialog, QSplashScreen, QMenu, QProgressBar,
+    QDialog, QDialogButtonBox, QFormLayout, QSpinBox, QSystemTrayIcon,
+    QMessageBox,
 )
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 import json
@@ -25,6 +27,9 @@ from core.scanner import (
     scan_network, get_local_subnet, get_network_interfaces, has_raw_socket_access
 )
 from core.validation import InvalidFlags, is_valid_target, sanitize_custom_flags
+from core.inventory import Inventory
+from core.scheduler import Schedule
+from core import alerts, report
 try:
     from core.scanners import (
         tcp_connect_scan, http_probe, get_ssl_info,
@@ -568,11 +573,27 @@ class MainWindow(QMainWindow):
         icon_path = os.path.join(os.path.dirname(__file__), "assets", "logo.png")
         self.setWindowIcon(QIcon(icon_path))
 
+        # Inventory + user settings (shared with the CLI through ~/.l0p4map)
+        self.inventory = Inventory()
+        self.alert_cfg = alerts.AlertConfig.load()
+        self.schedule = Schedule.load()
+        self._last_diff = None
+
         self._apply_theme()
         self._build_ui()
 
         self.live_timer = QTimer()
         self.live_timer.timeout.connect(self._live_scan)
+
+        self.schedule_timer = QTimer()
+        self.schedule_timer.timeout.connect(self._check_schedule)
+        self.schedule_timer.start(30_000)
+
+        self.tray = None
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray = QSystemTrayIcon(QIcon(icon_path), self)
+            self.tray.setToolTip("L0p4Map")
+            self.tray.show()
 
     def _apply_theme(self):
         self.setStyleSheet("""
@@ -781,6 +802,28 @@ class MainWindow(QMainWindow):
         self.scan_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.scan_button.clicked.connect(self._start_scan)
 
+        tools_menu = QMenu(self)
+        tools_menu.addAction("Rapport PDF…", self._generate_report)
+        tools_menu.addAction("Inventaire CSV…", self._export_inventory_csv)
+        tools_menu.addSeparator()
+        tools_menu.addAction("Planification…", self._open_schedule_dialog)
+        tools_menu.addAction("Alertes…", self._open_alerts_dialog)
+
+        self.btn_tools = QPushButton(" ⋯ ")
+        self.btn_tools.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_tools.setMenu(tools_menu)
+        self.btn_tools.setStyleSheet("""
+            QPushButton {
+                background-color: #111111;
+                color: #00ff99;
+                border: 1px solid #222222;
+                padding: 6px 10px;
+                font-size: 13px;
+            }
+            QPushButton:hover { border-color: #00ff99; }
+            QPushButton::menu-indicator { image: none; width: 0px; }
+        """)
+
         layout.addWidget(title)
         layout.addSpacing(16)
         layout.addWidget(self.subnet_label)
@@ -789,6 +832,7 @@ class MainWindow(QMainWindow):
         layout.addSpacing(12)
         layout.addWidget(self.iface_selector)
         layout.addStretch()
+        layout.addWidget(self.btn_tools)
         layout.addWidget(self.scan_button)
 
         return toolbar
@@ -1266,6 +1310,8 @@ class MainWindow(QMainWindow):
             self.scan_output.append(f"Open ports: {open_ports}")
         else:
             self.scan_output.append("No open ports found (quick scan)")
+        host = self.scan_target.text().strip().split(":")[0]
+        self._record_ports_for_host(host, open_ports)
 
     def _on_tcp_connect_evasion_result(self, result_dict):
         """Handle evasion scan results."""
@@ -2062,7 +2108,14 @@ class MainWindow(QMainWindow):
         menu.addAction(portScan_action)
         menu.addAction(as_action)
         menu.addAction(ta_action)
-        
+
+        meta_action = QAction("Étiqueter / grouper…", self)
+        meta_action.triggered.connect(
+            lambda: self._edit_device_meta(self.table.item(row, 1).text(), ip)
+        )
+        menu.addSeparator()
+        menu.addAction(meta_action)
+
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
 
@@ -2199,6 +2252,277 @@ class MainWindow(QMainWindow):
         self.worker.error.connect(self._on_scan_error)
         self.worker.start()
 
+    # -- inventory, alerts, reporting ------------------------------------
+    def _current_subnet(self) -> str:
+        if hasattr(self, "subnet_label"):
+            return self.subnet_label.text().replace("subnet:", "").strip()
+        return ""
+
+    def _desktop_notify(self, title: str, text: str):
+        if getattr(self, "tray", None) is not None:
+            self.tray.showMessage(
+                title, text, QSystemTrayIcon.MessageIcon.Information, 8000
+            )
+        else:
+            self.statusBar().showMessage(title, 8000)
+
+    def _notify_diff(self, diff, subnet: str):
+        title, body = alerts.format_scan_diff(diff, subnet=subnet)
+        results = alerts.dispatch(
+            self.alert_cfg, title, body, notifier=self._desktop_notify
+        )
+        failures = {k: v for k, v in results.items() if v}
+        if failures:
+            self.statusBar().showMessage(
+                "alerte: " + "; ".join(f"{k}: {v}" for k, v in failures.items()), 15000
+            )
+
+    def _apply_labels_to_table(self):
+        for row in range(self.table.rowCount()):
+            mac_item = self.table.item(row, 1)
+            host_item = self.table.item(row, 3)
+            if mac_item is None or host_item is None:
+                continue
+            device = self.inventory.get(mac_item.text())
+            if device and device["label"]:
+                text = device["label"]
+                if device["hostname"] and device["hostname"] != device["label"]:
+                    text = f"{device['label']} · {device['hostname']}"
+                host_item.setText(text)
+
+    def _edit_device_meta(self, mac: str, ip: str):
+        device = self.inventory.get(mac)
+        if device is None:
+            QMessageBox.information(
+                self, "L0p4Map",
+                "Appareil absent de l'inventaire : lance un scan d'abord.",
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Étiqueter {ip or mac}")
+        form = QFormLayout(dialog)
+        label_edit = QLineEdit(device["label"])
+        group_edit = QLineEdit(device["group"])
+        notes_edit = QLineEdit(device["notes"])
+        form.addRow("Nom", label_edit)
+        form.addRow("Groupe", group_edit)
+        form.addRow("Notes", notes_edit)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.inventory.set_meta(
+                mac,
+                label=label_edit.text().strip(),
+                group=group_edit.text().strip(),
+                notes=notes_edit.text().strip(),
+            )
+            self._apply_labels_to_table()
+
+    def _generate_report(self):
+        stamp = time.strftime("%Y%m%d-%H%M")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Enregistrer le rapport",
+            f"rapport-l0p4map-{stamp}.pdf", "PDF (*.pdf);;HTML (*.html)",
+        )
+        if not path:
+            return
+        try:
+            data = report.collect_data(
+                self.inventory, subnet=self._current_subnet()
+            )
+            if path.lower().endswith(".html"):
+                out = report.write_html(data, path)
+            else:
+                out = report.write_pdf(data, path)
+        except report.ReportError as exc:
+            QMessageBox.warning(self, "Rapport", str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001 - surface the error to the user
+            QMessageBox.warning(self, "Rapport", f"échec: {exc}")
+            return
+        self.statusBar().showMessage(f"rapport écrit: {out}", 10000)
+
+    def _export_inventory_csv(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Exporter l'inventaire", "inventaire-l0p4map.csv", "CSV (*.csv)"
+        )
+        if not path:
+            return
+        devices = self.inventory.devices()
+        with open(path, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow([
+                "ip", "mac", "nom", "constructeur", "groupe", "notes",
+                "premiere_vue", "derniere_vue", "scans",
+            ])
+            for device in devices:
+                writer.writerow([
+                    device["ip"], device["mac"], device["name"], device["vendor"],
+                    device["group"], device["notes"],
+                    time.strftime("%Y-%m-%d %H:%M", time.localtime(device["first_seen"]))
+                    if device["first_seen"] else "",
+                    time.strftime("%Y-%m-%d %H:%M", time.localtime(device["last_seen"]))
+                    if device["last_seen"] else "",
+                    device["seen_count"],
+                ])
+        self.statusBar().showMessage(f"{len(devices)} appareil(s) exportés", 8000)
+
+    def _open_alerts_dialog(self):
+        cfg = alerts.AlertConfig.load()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Alertes")
+        form = QFormLayout(dialog)
+
+        desktop = QCheckBox("Notification sur le bureau")
+        desktop.setChecked(cfg.desktop)
+        token = QLineEdit(cfg.telegram_token)
+        token.setPlaceholderText("123456:ABC…")
+        chat = QLineEdit(cfg.telegram_chat_id)
+        webhook = QLineEdit(cfg.webhook_url)
+        webhook.setPlaceholderText("https://hooks.slack.com/…")
+        smtp_host = QLineEdit(cfg.smtp_host)
+        smtp_port = QSpinBox()
+        smtp_port.setRange(1, 65535)
+        smtp_port.setValue(int(cfg.smtp_port or 587))
+        smtp_user = QLineEdit(cfg.smtp_user)
+        smtp_pass = QLineEdit(cfg.smtp_password)
+        smtp_pass.setEchoMode(QLineEdit.EchoMode.Password)
+        email_to = QLineEdit(cfg.email_to)
+
+        form.addRow(desktop)
+        form.addRow("Telegram token", token)
+        form.addRow("Telegram chat id", chat)
+        form.addRow("Webhook URL", webhook)
+        form.addRow("SMTP hôte", smtp_host)
+        form.addRow("SMTP port", smtp_port)
+        form.addRow("SMTP utilisateur", smtp_user)
+        form.addRow("SMTP mot de passe", smtp_pass)
+        form.addRow("Email destinataire", email_to)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.alert_cfg = alerts.AlertConfig(
+                desktop=desktop.isChecked(),
+                telegram_token=token.text().strip(),
+                telegram_chat_id=chat.text().strip(),
+                webhook_url=webhook.text().strip(),
+                smtp_host=smtp_host.text().strip(),
+                smtp_port=smtp_port.value(),
+                smtp_user=smtp_user.text().strip(),
+                smtp_password=smtp_pass.text(),
+                email_to=email_to.text().strip(),
+            )
+            self.alert_cfg.save()
+            active = ", ".join(self.alert_cfg.channels) or "aucun"
+            self.statusBar().showMessage(f"alertes enregistrées: {active}", 8000)
+
+    def _open_schedule_dialog(self):
+        current = Schedule.load()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Planification des scans")
+        form = QFormLayout(dialog)
+
+        enabled = QCheckBox("Activer les scans automatiques")
+        enabled.setChecked(current.enabled)
+        mode = QComboBox()
+        mode.addItem("Toutes les N minutes", "interval")
+        mode.addItem("Tous les jours à HH:MM", "daily")
+        mode.setCurrentIndex(0 if current.mode == "interval" else 1)
+        interval = QSpinBox()
+        interval.setRange(1, 1440)
+        interval.setValue(int(current.interval_minutes))
+        interval.setSuffix(" min")
+        at_time = QLineEdit(current.at_time)
+        at_time.setPlaceholderText("08:00")
+
+        form.addRow(enabled)
+        form.addRow("Mode", mode)
+        form.addRow("Intervalle", interval)
+        form.addRow("Heure quotidienne", at_time)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            new_schedule = Schedule(
+                enabled=enabled.isChecked(),
+                mode=mode.currentData(),
+                interval_minutes=interval.value(),
+                at_time=at_time.text().strip(),
+                last_run=current.last_run,
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Planification", str(exc))
+            return
+        if new_schedule.enabled and not new_schedule.last_run:
+            new_schedule.last_run = time.time()
+        new_schedule.save()
+        self.schedule = new_schedule
+        upcoming = new_schedule.next_run()
+        label = (
+            time.strftime("%Y-%m-%d %H:%M", time.localtime(upcoming))
+            if upcoming else "désactivée"
+        )
+        self.statusBar().showMessage(f"prochain scan: {label}", 10000)
+
+    def _check_schedule(self):
+        if not getattr(self, "schedule", None) or not self.schedule.enabled:
+            return
+        if not self.schedule.due():
+            return
+        if not self.raw_sockets:
+            self.schedule.enabled = False
+            self.schedule.save()
+            self.statusBar().showMessage(
+                "scan planifié impossible sans raw sockets : planification désactivée",
+                12000,
+            )
+            return
+        worker = getattr(self, "worker", None)
+        if worker is not None and worker.isRunning():
+            return
+        self.schedule.mark_run()
+        self.statusBar().showMessage("scan planifié en cours…", 5000)
+        self._start_scan()
+
+    def _record_ports_for_host(self, host: str, ports):
+        if not ports:
+            return
+        for device in getattr(self, "last_hosts", None) or []:
+            if device.get("ip") != host:
+                continue
+            try:
+                new_ports = self.inventory.record_ports(device["mac"], ports)
+            except Exception as exc:  # noqa: BLE001
+                self.statusBar().showMessage(f"inventaire: {exc}", 8000)
+                return
+            if new_ports:
+                self.statusBar().showMessage(
+                    f"nouveaux ports sur {host}: {new_ports}", 12000
+                )
+            return
+
     def _populate_table(self, hosts):
         for d in hosts:
             row = self.table.rowCount()
@@ -2215,7 +2539,24 @@ class MainWindow(QMainWindow):
     def _on_scan_finished(self, hosts):
         self._populate_table(hosts)
         self.last_hosts = hosts
-        self.statusBar().showMessage(f"{len(hosts)} device found.")
+        self._apply_labels_to_table()
+
+        subnet = self._current_subnet()
+        try:
+            diff = self.inventory.record_scan(hosts, subnet=subnet, source="gui")
+        except Exception as exc:  # noqa: BLE001 - inventory must not break a scan
+            diff = None
+            self.statusBar().showMessage(
+                f"{len(hosts)} appareil(s) — inventaire en échec: {exc}", 12000
+            )
+        if diff is not None:
+            self._last_diff = diff
+            self.statusBar().showMessage(
+                f"{len(hosts)} appareil(s) — {diff.summary()}", 12000
+            )
+            if diff.has_changes:
+                self._notify_diff(diff, subnet)
+
         self.scan_button.setEnabled(True)
         self._update_graph(hosts)
         self.btn_export_graph.setDisabled(False)
