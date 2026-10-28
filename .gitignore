@@ -8,3 +8,7 @@ venv/
 dist/
 build/
 .DS_Store
+
+# runtime artefacts
+traffic.csv
+*.log

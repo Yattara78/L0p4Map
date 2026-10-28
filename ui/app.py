@@ -21,7 +21,9 @@ from scapy.all import sniff, IP as ScapyIP, TCP,UDP, ICMP
 from collections import defaultdict
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 # lightweight scanners
-from core.scanner import scan_network, get_local_subnet, check_root, get_network_interfaces
+from core.scanner import (
+    scan_network, get_local_subnet, get_network_interfaces, has_raw_socket_access
+)
 from core.validation import InvalidFlags, is_valid_target, sanitize_custom_flags
 try:
     from core.scanners import (
@@ -166,13 +168,19 @@ class ActionWorker(QThread):
 
 class ScanWorker(QThread):
     finished = pyqtSignal(list)
+    error = pyqtSignal(str)
 
     def __init__(self, subnet):
         super().__init__()
         self.subnet = subnet
 
     def run(self):
-        hosts = scan_network(self.subnet)
+        try:
+            hosts = scan_network(self.subnet)
+        except Exception as exc:
+            self.error.emit(str(exc))
+            self.finished.emit([])
+            return
         self.finished.emit(hosts)
 
 
@@ -553,6 +561,10 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("L0p4Map")
         self.setMinimumSize(1200, 700)
 
+        # Unprivileged runs are supported: only ARP discovery, packet capture
+        # and ICMP traceroute need raw sockets, everything else still works.
+        self.raw_sockets = has_raw_socket_access()
+
         icon_path = os.path.join(os.path.dirname(__file__), "assets", "logo.png")
         self.setWindowIcon(QIcon(icon_path))
 
@@ -730,6 +742,15 @@ class MainWindow(QMainWindow):
         self.subnet_label = QLabel("subnet detection...")
         self.subnet_label.setObjectName("subnet_label")
 
+        self.priv_label = QLabel()
+        self.priv_label.setStyleSheet(
+            "color: #ff9944; font-size: 10px; letter-spacing: 1px;"
+        )
+        if self.raw_sockets:
+            self.priv_label.hide()
+        else:
+            self.priv_label.setText("// UNPRIVILEGED — ARP + capture off")
+
         self.iface_selector = QComboBox()
         self.iface_selector.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.iface_selector.setStyleSheet("""
@@ -763,6 +784,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(title)
         layout.addSpacing(16)
         layout.addWidget(self.subnet_label)
+        layout.addSpacing(8)
+        layout.addWidget(self.priv_label)
         layout.addSpacing(12)
         layout.addWidget(self.iface_selector)
         layout.addStretch()
@@ -1472,12 +1495,21 @@ class MainWindow(QMainWindow):
     def _live_scan(self):
         if hasattr(self, 'live_worker') and self.live_worker.isRunning():
             return
-        
+        if not self.raw_sockets:
+            self.live_timer.stop()
+            self.statusBar().showMessage(
+                "Live monitoring needs raw sockets — disabled in unprivileged mode"
+            )
+            return
+
         iface = self.iface_selector.currentData()
+        if not iface:
+            return
         subnet = get_local_subnet(iface["name"])
 
         self.live_worker = ScanWorker(subnet)
         self.live_worker.finished.connect(self._on_live_scan_finished)
+        self.live_worker.error.connect(self._on_scan_error)
         self.live_worker.start()
 
     def _on_live_scan_finished(self, hosts):
@@ -1776,6 +1808,11 @@ class MainWindow(QMainWindow):
     
 
     def _ta_start(self):
+        if not self.raw_sockets:
+            self.ta_status.setText(
+                "// packet capture needs root or CAP_NET_RAW — not available in this session"
+            )
+            return
         iface = self.iface_selector.currentData()
         if not iface:
             return
@@ -2137,6 +2174,17 @@ class MainWindow(QMainWindow):
             btn.setEnabled(True)
 
     def _start_scan(self):
+        if not self.raw_sockets:
+            self.statusBar().showMessage(
+                "ARP scan needs root or CAP_NET_RAW — restart with sudo "
+                "(macOS) or setcap on the interpreter (Linux)"
+            )
+            return
+        iface = self.iface_selector.currentData()
+        if not iface:
+            self.statusBar().showMessage("No network interface selected")
+            return
+
         self.scan_button.setEnabled(False)
         self.btn_export_graph.setEnabled(False)
         self.statusBar().showMessage("Scanning...")
@@ -2148,6 +2196,7 @@ class MainWindow(QMainWindow):
 
         self.worker = ScanWorker(subnet)
         self.worker.finished.connect(self._on_scan_finished)
+        self.worker.error.connect(self._on_scan_error)
         self.worker.start()
 
     def _populate_table(self, hosts):
@@ -2158,6 +2207,10 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, 1, QTableWidgetItem(d["mac"]))
             self.table.setItem(row, 2, QTableWidgetItem(d["vendor"]))
             self.table.setItem(row, 3, QTableWidgetItem(d["hostname"]))
+
+    def _on_scan_error(self, message: str):
+        self.statusBar().showMessage(f"scan error: {message}")
+        self.scan_button.setEnabled(True)
 
     def _on_scan_finished(self, hosts):
         self._populate_table(hosts)
@@ -2214,7 +2267,11 @@ class MainWindow(QMainWindow):
 
         self._bind_action_button(True)
         self._cancel_current_action()
-        self.action_worker = ActionWorker(["traceroute", "-I", ip])
+        # -I (ICMP) needs raw sockets; plain UDP traceroute works unprivileged
+        traceroute_cmd = (
+            ["traceroute", "-I", ip] if self.raw_sockets else ["traceroute", ip]
+        )
+        self.action_worker = ActionWorker(traceroute_cmd)
         self.action_worker.output.connect(self.output_box.append)
         self.action_worker.finished.connect(self._on_action_finished)
         self.action_worker.start()
@@ -2738,9 +2795,14 @@ class MainWindow(QMainWindow):
             self._as_display(self._as_results[target])
 
 if __name__ == "__main__":
-    check_root()
     os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--no-sandbox --disable-gpu --disable-software-rasterizer"
     os.environ["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
+    if not has_raw_socket_access():
+        print(
+            "L0p4Map: unprivileged session — ARP discovery, packet capture and "
+            "ICMP traceroute are disabled. Use sudo (macOS) or grant CAP_NET_RAW (Linux).",
+            file=sys.stderr,
+        )
     app = QApplication(sys.argv)
     logo = LogoIniziale()
     logo.show()

@@ -2,7 +2,8 @@
 # L0p4Map launcher: checks dependencies, keeps the checkout up to date and
 # starts the GUI with the least privilege that still allows raw sockets.
 #
-#   ./L0p4Map.sh          install deps, update, then launch
+#   ./L0p4Map.sh          install deps, update, then launch (unprivileged)
+#   ./L0p4Map.sh --sudo   launch with sudo for ARP discovery and capture
 #   ./L0p4Map.sh --check  verify the environment only, do not launch
 set -euo pipefail
 
@@ -108,11 +109,12 @@ report_privileges() {
 }
 
 main() {
-    local check_only=0
+    local check_only=0 want_sudo=0
     case "${1:-}" in
         --check) check_only=1 ;;
+        --sudo) want_sudo=1 ;;
         -h|--help)
-            sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
     esac
@@ -134,11 +136,12 @@ main() {
     fi
 
     cd "$REPO_DIR"
-    if [ "$(id -u)" -eq 0 ] || raw_sockets_available; then
-        exec "$PY" ui/app.py
+    if [ "$want_sudo" -eq 1 ] && [ "$(id -u)" -ne 0 ]; then
+        say "Starting with sudo so ARP discovery and packet capture work..."
+        exec sudo -E "$PY" ui/app.py
     fi
-    say "Starting with sudo so ARP/packet capture work..."
-    exec sudo -E "$PY" ui/app.py
+    # Unprivileged mode is fully supported: only ARP/capture are disabled.
+    exec "$PY" ui/app.py
 }
 
 main "$@"

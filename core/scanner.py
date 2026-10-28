@@ -85,9 +85,29 @@ def get_network_interfaces():
         interfaces.append({"name": iface, "ip": ip})
     return interfaces
 
+def has_raw_socket_access() -> bool:
+    """True when this process can open raw sockets (root, or CAP_NET_RAW).
+
+    Used by the UI to degrade gracefully instead of refusing to start: an
+    unprivileged run still does nmap/tcp-connect scans, only ARP discovery and
+    packet capture are unavailable.
+    """
+    if os.getuid() == 0:
+        return True
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+    except OSError:
+        return False
+    probe.close()
+    return True
+
+
 def check_root():
-    if os.getuid() != 0:
-        raise PermissionError("Execute the program with SUDO!")
+    if not has_raw_socket_access():
+        raise PermissionError(
+            "ARP scan and packet capture need root or CAP_NET_RAW "
+            "(Linux: sudo setcap cap_net_raw,cap_net_admin+eip $(readlink -f $(which python3)))"
+        )
 
 def get_local_subnet(iface_name: Optional[str] = None) -> str:
     interfaces = psutil.net_if_addrs()
