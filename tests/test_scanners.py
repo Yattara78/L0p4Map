@@ -1,4 +1,3 @@
-import socket
 
 from core.scanners.tcp_connect import tcp_connect_scan
 from core.scanners.http_probe import http_probe

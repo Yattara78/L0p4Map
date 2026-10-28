@@ -2,7 +2,7 @@
 
 Provides a thin wrapper around nmap.PortScanner if installed.
 """
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
 try:
     import nmap

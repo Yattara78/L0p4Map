@@ -8,8 +8,7 @@ import dns.resolver
 import dns.zone
 import dns.query
 import subprocess
-import json
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 import logging
 
 logger = logging.getLogger(__name__)
