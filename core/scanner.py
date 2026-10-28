@@ -3,9 +3,8 @@ from __future__ import annotations
 import ipaddress
 import socket
 import psutil
-import requests
 import csv as _csv
-from typing import Optional, List, Dict, Union
+from typing import Optional, List, Dict
 from scapy.all import ARP, Ether, srp, sniff, IP as ScapyIP, TCP, UDP
 import os
 from concurrent.futures import ThreadPoolExecutor

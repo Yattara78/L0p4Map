@@ -7,7 +7,6 @@ from PyQt6.QtWidgets import (
     QComboBox, QStackedWidget, QCheckBox, QLineEdit, QScrollArea,
     QFileDialog, QSplashScreen, QMenu, QProgressBar
 )
-import ipaddress
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 import json
 import re
@@ -18,11 +17,12 @@ from PyQt6.QtSvg import QSvgRenderer
 import subprocess
 import os
 import csv
-from scapy.all import ARP, Ether, srp, sniff, IP as ScapyIP, TCP,UDP, ICMP
+from scapy.all import sniff, IP as ScapyIP, TCP,UDP, ICMP
 from collections import defaultdict
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 # lightweight scanners
-from core.scanner import scan_network, get_local_subnet, check_root, get_network_interfaces, capture_traffic
+from core.scanner import scan_network, get_local_subnet, check_root, get_network_interfaces
+from core.validation import InvalidFlags, is_valid_target, sanitize_custom_flags
 try:
     from core.scanners import (
         tcp_connect_scan, http_probe, get_ssl_info,
@@ -31,7 +31,7 @@ try:
         IDSEvader, PassiveReconConfig,
         SecureLogger, ScanActivity
     )
-except Exception as e:
+except Exception:
     tcp_connect_scan = None
     http_probe = None
     get_ssl_info = None
@@ -115,18 +115,53 @@ class ActionWorker(QThread):
     def __init__(self, cmd: list):
         super().__init__()
         self.cmd = cmd
+        self.process = None
+        self._cancelled = False
 
     def run(self):
-        process = subprocess.Popen(
-            self.cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True
-        )
-        for riga in process.stdout:
-            self.output.emit(riga.rstrip())
-        process.wait()
-        self.finished.emit()
+        try:
+            proc = subprocess.Popen(
+                self.cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except (FileNotFoundError, PermissionError) as exc:
+            self.output.emit(f"// error: cannot start {self.cmd[0]}: {exc}")
+            self.finished.emit()
+            return
+
+        self.process = proc
+        try:
+            if proc.stdout is not None:
+                for line in proc.stdout:
+                    if self._cancelled:
+                        break
+                    self.output.emit(line.rstrip())
+                proc.stdout.close()
+        finally:
+            proc.wait()
+            self.finished.emit()
+
+    def cancel(self):
+        """Terminate the child process, not just the Qt thread.
+
+        QThread.terminate() left nmap running as an orphan that kept scanning
+        (and writing files) after the user pressed STOP.
+        """
+        self._cancelled = True
+        proc = self.process
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=3)
+        except Exception:
+            pass
 
 
 class ScanWorker(QThread):
@@ -141,23 +176,40 @@ class ScanWorker(QThread):
         self.finished.emit(hosts)
 
 
+MAX_TRAFFIC_ROWS = 5000
+TRAFFIC_FLUSH_INTERVAL = 0.2
+
+
 class TrafficWorker(QThread):
-    packet_captured = pyqtSignal(dict)
+    """Capture IP traffic and hand it to the GUI in small batches.
+
+    One Qt signal per packet froze the window on busy LANs (thousands of
+    events per second); packets are buffered and flushed ~5x/second instead.
+    """
+
+    packets = pyqtSignal(list)
+    error = pyqtSignal(str)
     finished = pyqtSignal()
 
     def __init__(self, iface: str):
         super().__init__()
         self.iface = iface
         self._running = True
+        self._buffer = []
+        self._last_flush = 0.0
 
     def stop(self):
         self._running = False
 
+    def _flush(self):
+        if self._buffer:
+            self.packets.emit(self._buffer)
+            self._buffer = []
+            self._last_flush = time.monotonic()
+
     def run(self):
         def process(pkt):
-            if not self._running:
-                return
-            if ScapyIP not in pkt:
+            if not self._running or ScapyIP not in pkt:
                 return
 
             src = pkt[ScapyIP].src
@@ -175,22 +227,32 @@ class TrafficWorker(QThread):
             elif ICMP in pkt:
                 proto = "ICMP"
 
-            self.packet_captured.emit({
+            self._buffer.append({
                 "src": src,
                 "dst": dst,
                 "proto": proto,
                 "port": port,
-                "size": size
+                "size": size,
             })
+            if time.monotonic() - self._last_flush >= TRAFFIC_FLUSH_INTERVAL:
+                self._flush()
 
-        sniff(
-            iface=self.iface,
-            prn=process,
-            store=False,
-            filter="ip",
-            stop_filter=lambda _: not self._running
-        )
-        self.finished.emit()
+        try:
+            # timeout + stop_filter: STOP now takes effect even on a silent link
+            while self._running:
+                sniff(
+                    iface=self.iface,
+                    prn=process,
+                    store=False,
+                    filter="ip",
+                    timeout=1.0,
+                    stop_filter=lambda _: not self._running,
+                )
+        except Exception as exc:
+            self.error.emit(str(exc))
+        finally:
+            self._flush()
+            self.finished.emit()
 
 class TcpConnectWorker(QThread):
     result = pyqtSignal(list)
@@ -264,31 +326,6 @@ class TcpConnectEvasionWorker(QThread):
             self.result.emit({"error": str(e)})
         self.finished.emit()
 
-def is_valid_target(text: str) -> bool:
-    text = text.strip()
-    if not text:
-        return False
-    try:
-        ipaddress.ip_address(text)
-        return True
-    except ValueError:
-        pass
-    try:
-        ipaddress.ip_network(text, strict=False)
-        return True
-    except ValueError:
-        pass
-    if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}-\d{1,3}$", text):
-        return True
-    hostname_re = re.compile(
-        r"^(?!-)[a-zA-Z0-9\-]{1,63}(?:\.[a-zA-Z0-9\-]{1,63})*\.?$"
-    )
-    if hostname_re.match(text):
-        if re.match(r"^\d+$", text):
-            return False
-        return True
-
-
 CVSS_MIN = 4.0
 MAX_CVES_PER_PORT = 5
 GENERIC_SERVICES = {"tcpwrapped", "unknown", "filtered", ""}
@@ -312,7 +349,7 @@ class AttackSurfaceWorker(QThread):
         self.target = target
 
     def run(self):
-        import tempfile, xml.etree.ElementTree as ET
+        import tempfile
 
         tmp = tempfile.NamedTemporaryFile(suffix=".xml", delete=False)
         tmp_path = tmp.name
@@ -378,7 +415,6 @@ class AttackSurfaceWorker(QThread):
 
     def _parse(self, xml_path: str) -> dict:
         import xml.etree.ElementTree as ET
-        from collections import defaultdict
 
         result = {
             "target": self.target,
@@ -1072,10 +1108,56 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.scan_output, stretch=1)
         return container
 
+    @staticmethod
+    def _bind_button(btn, slot, text: str):
+        """Point a RUN/STOP button at a slot without a blind disconnect()."""
+        try:
+            btn.clicked.disconnect()
+        except TypeError:
+            pass
+        btn.setText(text)
+        btn.clicked.connect(slot)
+
+    def _bind_scan_button(self, running: bool):
+        self._bind_button(
+            self.btn_run_scan,
+            self._stop_nmap_scan if running else self._run_nmap_scan,
+            "[ STOP ]" if running else "[ RUN SCAN ]",
+        )
+
+    def _bind_action_button(self, running: bool):
+        self._bind_button(
+            self.btn_traceroute,
+            self._stop_action if running else self._run_traceroute,
+            "[ STOP ]" if running else "[ TRACEROUTE ]",
+        )
+
+    def _cancel_current_action(self):
+        """Kill the child process of the previous ping/traceroute/nmap run."""
+        worker = getattr(self, "action_worker", None)
+        if worker is not None and worker.isRunning():
+            try:
+                worker.finished.disconnect()
+            except TypeError:
+                pass
+            worker.cancel()
+            worker.wait(3000)
+
     def _run_nmap_scan(self):
         target = self.scan_target.text().strip()
         if not target:
             self.scan_output.append("// error: no target specified")
+            return
+        if not is_valid_target(target):
+            self.scan_output.append(
+                "// error: invalid target — expected an IP, a CIDR block, "
+                "an IP range (192.168.1.10-50) or a hostname"
+            )
+            return
+        try:
+            custom_flags = sanitize_custom_flags(self.custom_flags.text())
+        except InvalidFlags as exc:
+            self.scan_output.append(f"// error: {exc}")
             return
 
         cmd = ["nmap"]
@@ -1083,10 +1165,7 @@ class MainWindow(QMainWindow):
             if cb.isChecked():
                 cmd.extend(flag.split())
 
-        custom = self.custom_flags.text().strip()
-        if custom:
-            cmd.extend(custom.split())
-
+        cmd.extend(custom_flags)
         cmd.append(target)
 
         self.scan_cmd_label.setText("// " + " ".join(cmd))
@@ -1098,12 +1177,11 @@ class MainWindow(QMainWindow):
                 border-bottom: 1px solid #1a1a1a;
         """)
         self.scan_output.clear()
-        self.scan_output.append(f"// {''.join(cmd)}\n")
+        self.scan_output.append(f"// {' '.join(cmd)}\n")
 
-        self.btn_run_scan.setText("[ STOP ]")
-        self.btn_run_scan.clicked.disconnect()
-        self.btn_run_scan.clicked.connect(self._stop_nmap_scan)
+        self._bind_scan_button(True)
 
+        self._cancel_current_action()
         self.action_worker = ActionWorker(cmd)
         self.action_worker.output.connect(self.scan_output.append)
         self.action_worker.finished.connect(self._on_nmap_finished)
@@ -1139,7 +1217,7 @@ class MainWindow(QMainWindow):
         if use_evasion:
             # Import evasion module
             try:
-                from core.scanners import tcp_connect_scan_with_evasion, FirewallEvasionConfig
+                from core.scanners import FirewallEvasionConfig
                 config = FirewallEvasionConfig()
                 config.timing_mode = self.evasion_timing.currentData()
                 config.use_decoys = self.evasion_decoys.isChecked()
@@ -1245,21 +1323,22 @@ class MainWindow(QMainWindow):
         self.scan_output.append("// SSL info finished.")
 
     def _stop_nmap_scan(self):
-        if hasattr(self, 'action_worker') and self.action_worker.isRunning():
-            self.action_worker.finished.disconnect()
-            self.action_worker.terminate()
+        worker = getattr(self, "action_worker", None)
+        if worker is not None and worker.isRunning():
+            try:
+                worker.finished.disconnect()
+            except TypeError:
+                pass
+            worker.cancel()
+            worker.wait(4000)
         self.scan_output.append("\n// Interrupted.")
         self.btn_export_scan.setDisabled(True)
-        self.btn_run_scan.setText("[ RUN SCAN ]")
-        self.btn_run_scan.clicked.disconnect()
-        self.btn_run_scan.clicked.connect(self._run_nmap_scan)
+        self._bind_scan_button(False)
 
     def _on_nmap_finished(self):
         self.scan_output.append("\n// Done.")
         self.btn_export_scan.setDisabled(False)
-        self.btn_run_scan.setText("[ RUN SCAN ]")
-        self.btn_run_scan.clicked.disconnect()
-        self.btn_run_scan.clicked.connect(self._run_nmap_scan)
+        self._bind_scan_button(False)
 
     def _build_graph_page(self):
         page = QWidget()
@@ -1721,13 +1800,16 @@ class MainWindow(QMainWindow):
         """)
 
         self.ta_worker = TrafficWorker(iface["name"])
-        self.ta_worker.packet_captured.connect(self._ta_on_packet)
+        self.ta_worker.packets.connect(self._ta_on_packets)
+        self.ta_worker.error.connect(self._ta_on_error)
         self.ta_worker.finished.connect(self._ta_on_finished)
         self.ta_worker.start()
 
     def _ta_stop(self):
-        if hasattr(self, 'ta_worker') and self.ta_worker.isRunning():
-            self.ta_worker.stop()
+        worker = getattr(self, "ta_worker", None)
+        if worker is not None and worker.isRunning():
+            worker.stop()
+            worker.wait(3000)
         self.btn_start_capture.setEnabled(True)
         self.btn_stop_capture.setEnabled(False)
         self.ta_status.setStyleSheet("""
@@ -1739,8 +1821,10 @@ class MainWindow(QMainWindow):
         """)
 
     def _ta_clear(self):
-        if hasattr(self, 'ta_worker') and self.ta_worker.isRunning():
-            self.ta_worker.stop()
+        worker = getattr(self, "ta_worker", None)
+        if worker is not None and worker.isRunning():
+            worker.stop()
+            worker.wait(3000)
             self.btn_start_capture.setEnabled(True)
             self.btn_stop_capture.setEnabled(False)
         self._ta_packets = []
@@ -1753,47 +1837,49 @@ class MainWindow(QMainWindow):
         self.btn_ta_export.setEnabled(False)
         self.ta_status.setText("// cleared — press [ START ] to begin capture")
 
-    def _ta_on_packet(self, pkt: dict):
-        if not hasattr(self, '_ta_packets'):
+    def _ta_on_packets(self, packets: list):
+        if not hasattr(self, '_ta_packets') or not packets:
             return
-    
+
         if self._ta_start_time is None:
             self._ta_start_time = time.time()
-    
-        elapsed = time.time() - self._ta_start_time
-        self._ta_packet_count += 1
-    
-        src_label = self._resolve_ip_label(pkt["src"])
-        dst_label = self._resolve_ip_label(pkt["dst"])
-    
-        packet_data = {
-            "n": self._ta_packet_count,
-            "time": f"{elapsed:.3f}s",
-            "src": pkt["src"],
-            "dst": pkt["dst"],
-            "src_label": src_label,
-            "dst_label": dst_label,
-            "proto": pkt["proto"],
-            "port": pkt["port"],
-            "size": pkt["size"],
-        }
-    
-        self._ta_packets.append(packet_data)
-    
-        for ip in [pkt["src"], pkt["dst"]]:
-            if ip not in self._ta_device_stats:
-                self._ta_device_stats[ip] = 0
-            self._ta_device_stats[ip] += 1
 
-        self._ta_add_row(packet_data)
-    
-        if self._ta_packet_count % 20 == 0 or self._ta_packet_count <= 5:
-            self._ta_update_device_list()
-            self.ta_status.setText(
-                f"// {self._ta_packet_count} packets captured — {elapsed:.1f}s"
-            )
-            if self._ta_packet_count > 0:
-                self.btn_ta_export.setEnabled(True)
+        elapsed = time.time() - self._ta_start_time
+        rows = []
+
+        for pkt in packets:
+            self._ta_packet_count += 1
+            rows.append({
+                "n": self._ta_packet_count,
+                "time": f"{elapsed:.3f}s",
+                "src": pkt["src"],
+                "dst": pkt["dst"],
+                "src_label": self._resolve_ip_label(pkt["src"]),
+                "dst_label": self._resolve_ip_label(pkt["dst"]),
+                "proto": pkt["proto"],
+                "port": pkt["port"],
+                "size": pkt["size"],
+            })
+            for ip in (pkt["src"], pkt["dst"]):
+                self._ta_device_stats[ip] = self._ta_device_stats.get(ip, 0) + 1
+
+        self._ta_packets.extend(rows)
+        # bound memory: only the newest MAX_TRAFFIC_ROWS rows are exportable
+        overflow = len(self._ta_packets) - MAX_TRAFFIC_ROWS
+        if overflow > 0:
+            del self._ta_packets[:overflow]
+
+        self._ta_append_rows(rows)
+        self._ta_update_device_list()
+        self.ta_status.setText(
+            f"// {self._ta_packet_count} packets captured — {elapsed:.1f}s"
+        )
+        self.btn_ta_export.setEnabled(True)
+
+    def _ta_on_error(self, message: str):
+        self.ta_status.setText(f"// capture error: {message}")
+        self.btn_start_capture.setEnabled(True)
+        self.btn_stop_capture.setEnabled(False)
 
     
     def _resolve_ip_label(self, ip: str) -> str:
@@ -1806,37 +1892,57 @@ class MainWindow(QMainWindow):
         return ip
     
 
-    def _ta_add_row(self, pkt: dict):
+    def _ta_append_rows(self, rows: list):
+        """Insert a batch of packets in one shot, keeping the table capped."""
+        if not rows:
+            return
+
         proto_colors = {
             "TCP":  "#1a1a2e",
             "UDP":  "#1a2e1a",
             "ICMP": "#2e1a1a",
             "OTHER": "#111111",
         }
-        bg = QColor(proto_colors.get(pkt["proto"], "#111111"))
+        proto_text = {
+            "TCP":  "#4488ff",
+            "UDP":  "#44cc88",
+            "ICMP": "#ff8844",
+            "OTHER": "#888888",
+        }
 
-        row = self.ta_table.rowCount()
-        self.ta_table.insertRow(row)
+        table = self.ta_table
+        table.setUpdatesEnabled(False)
+        try:
+            start = table.rowCount()
+            table.setRowCount(start + len(rows))
+            for offset, pkt in enumerate(rows):
+                row = start + offset
+                bg = QColor(proto_colors.get(pkt["proto"], "#111111"))
+                values = (
+                    str(pkt["n"]),
+                    pkt["time"],
+                    pkt["src_label"],
+                    pkt["dst_label"],
+                    pkt["proto"],
+                    pkt["port"],
+                    f"{pkt['size']}B",
+                )
+                for col, text in enumerate(values):
+                    item = QTableWidgetItem(text)
+                    item.setBackground(bg)
+                    if col == 4:
+                        item.setForeground(
+                            QColor(proto_text.get(pkt["proto"], "#888888"))
+                        )
+                    table.setItem(row, col, item)
 
-        items = [
-            str(pkt["n"]),
-            pkt["time"],
-            pkt["src_label"],
-            pkt["dst_label"],
-            pkt["proto"],
-            pkt["port"],
-            f"{pkt['size']}B",
-        ]
+            overflow = table.rowCount() - MAX_TRAFFIC_ROWS
+            if overflow > 0:
+                table.model().removeRows(0, overflow)
+        finally:
+            table.setUpdatesEnabled(True)
 
-        for col, text in enumerate(items):
-            item = QTableWidgetItem(text)
-            item.setBackground(bg)
-            if col == 4: 
-                colors = {"TCP": "#4488ff", "UDP": "#44cc88", "ICMP": "#ff8844", "OTHER": "#888888"}
-                item.setForeground(QColor(colors.get(pkt["proto"], "#888888")))
-            self.ta_table.setItem(row, col, item)
-
-        self.ta_table.scrollToBottom()
+        table.scrollToBottom()
 
     def _ta_update_device_list(self):
         self.ta_device_list.setRowCount(0)
@@ -2089,6 +2195,7 @@ class MainWindow(QMainWindow):
         self.output_box.clear()
         self.output_box.append(f"// ping {ip}\n")
 
+        self._cancel_current_action()
         self.action_worker = ActionWorker(["ping", "-c", "4", ip])
         self.action_worker.output.connect(self.output_box.append)
         self.action_worker.finished.connect(
@@ -2105,29 +2212,28 @@ class MainWindow(QMainWindow):
         self.output_box.clear()
         self.output_box.append(f"// traceroute {ip}\n")
 
-        self.btn_traceroute.setText("[ STOP ]")
-        self.btn_traceroute.clicked.disconnect()
-        self.btn_traceroute.clicked.connect(self._stop_action)
-
+        self._bind_action_button(True)
+        self._cancel_current_action()
         self.action_worker = ActionWorker(["traceroute", "-I", ip])
         self.action_worker.output.connect(self.output_box.append)
         self.action_worker.finished.connect(self._on_action_finished)
         self.action_worker.start()
 
     def _stop_action(self):
-        if hasattr(self, 'action_worker') and self.action_worker.isRunning():
-            self.action_worker.finished.disconnect()
-            self.action_worker.terminate()
+        worker = getattr(self, "action_worker", None)
+        if worker is not None and worker.isRunning():
+            try:
+                worker.finished.disconnect()
+            except TypeError:
+                pass
+            worker.cancel()
+            worker.wait(4000)
         self.output_box.append("\n// interrupted.")
-        self.btn_traceroute.setText("[ TRACEROUTE ]")
-        self.btn_traceroute.clicked.disconnect()
-        self.btn_traceroute.clicked.connect(self._run_traceroute)
+        self._bind_action_button(False)
 
     def _on_action_finished(self):
         self.output_box.append("\n// done.")
-        self.btn_traceroute.setText("[ TRACEROUTE ]")
-        self.btn_traceroute.clicked.disconnect()
-        self.btn_traceroute.clicked.connect(self._run_traceroute)
+        self._bind_action_button(False)
 
     def _build_attackSurface_page(self):
         self.scanning = False

@@ -3,10 +3,9 @@ IDS/IPS evasion and detection module
 Techniques to avoid detection and detect when defenses are active
 """
 
-import time
 import random
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -114,7 +113,7 @@ class IDSEvader:
         }
         
         try:
-            from scapy.all import IP, TCP, UDP, ICMP, Raw, send
+            from scapy.all import IP, TCP, UDP, ICMP, Raw, send  # noqa: F401
             
             payload_types = [
                 ("HTTP-like", b"GET / HTTP/1.1\r\nHost: test\r\n"),

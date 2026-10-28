@@ -6,7 +6,6 @@ techniques like timing control, decoys, and packet manipulation.
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import socket
-import time
 from typing import Dict, Iterable, List, Optional
 
 from .firewall_evasion import FirewallEvader, FirewallEvasionConfig

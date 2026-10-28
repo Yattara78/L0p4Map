@@ -17,7 +17,6 @@ Techniques included:
   - Packet size variation (avoid signature-based detection)
 """
 
-import socket
 import random
 import time
 from typing import Dict, List, Optional

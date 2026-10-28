@@ -6,11 +6,11 @@ Prevents forensic analysis of scan activity
 import logging
 import json
 import os
+import base64
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 import hashlib
-import hmac
 
 try:
     from cryptography.fernet import Fernet
@@ -19,6 +19,10 @@ except ImportError:
     CRYPTO_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+# Encrypted archive layout: magic || 16-byte salt || Fernet token
+ARCHIVE_MAGIC = b"L0P4MAP-ENC1"
+PBKDF2_ITERATIONS = 200_000
 
 
 class SecureLogger:
@@ -56,9 +60,13 @@ class SecureLogger:
             if encryption_key is None:
                 self.cipher = Fernet(Fernet.generate_key())
             else:
-                # Derive key from provided string
-                key_hash = hashlib.sha256(encryption_key.encode()).digest()[:32]
-                derived_key = Fernet.generate_key()  # Would need proper key derivation
+                # Fernet wants a base64-encoded 32-byte key; deriving it from
+                # the passphrase keeps the logs readable across restarts. The
+                # previous code generated a random key and threw the passphrase
+                # away, so every restart made the old logs unreadable.
+                derived_key = base64.urlsafe_b64encode(
+                    hashlib.sha256(encryption_key.encode()).digest()
+                )
                 self.cipher = Fernet(derived_key)
         
         # Create log directory if specified
@@ -277,11 +285,19 @@ class SecureLogger:
             }
             
             content = json.dumps(export_data, default=str).encode()
-            
-            # Encrypt with optional password
+
             if password and self.enable_encryption:
-                # Simple password protection
-                password_hash = hashlib.sha256(password.encode()).digest()
+                # Derive a key from the password + a random salt so the archive
+                # can only be reopened with that password (it used to be
+                # encrypted with the logger key, which made the password inert).
+                salt = os.urandom(16)
+                key = base64.urlsafe_b64encode(
+                    hashlib.pbkdf2_hmac(
+                        "sha256", password.encode(), salt, PBKDF2_ITERATIONS
+                    )
+                )
+                encrypted = ARCHIVE_MAGIC + salt + Fernet(key).encrypt(content)
+            elif self.enable_encryption:
                 encrypted = self.cipher.encrypt(content)
             else:
                 encrypted = content

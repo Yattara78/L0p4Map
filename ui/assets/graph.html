@@ -195,18 +195,30 @@ function getRoleStyle(role) {
   return styles[role] || styles.unknown;
 }
 
+function esc(value) {
+  // Device fields (hostname, vendor, MAC) come straight off the wire via
+  // mDNS/NetBIOS/DHCP. Escaping them keeps a rogue host from injecting markup
+  // into this WebEngine view.
+  return String(value === undefined || value === null ? "" : value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 function makeTooltip(role, device, style) {
   const el = document.createElement("div");
   el.innerHTML = `
     <div style="color:${style.border};font-weight:bold;margin-bottom:6px;letter-spacing:1px">${style.label}</div>
     <div style="color:#888;margin-bottom:2px">IP</div>
-    <div style="color:#e0e0e0;margin-bottom:6px">${device.ip}</div>
+    <div style="color:#e0e0e0;margin-bottom:6px">${esc(device.ip)}</div>
     <div style="color:#888;margin-bottom:2px">MAC</div>
-    <div style="color:#e0e0e0;margin-bottom:6px">${device.mac}</div>
+    <div style="color:#e0e0e0;margin-bottom:6px">${esc(device.mac)}</div>
     <div style="color:#888;margin-bottom:2px">VENDOR</div>
-    <div style="color:#e0e0e0;margin-bottom:6px">${device.vendor || "Unknown"}</div>
+    <div style="color:#e0e0e0;margin-bottom:6px">${esc(device.vendor || "Unknown")}</div>
     <div style="color:#888;margin-bottom:2px">HOSTNAME</div>
-    <div style="color:#e0e0e0">${device.hostname}</div>
+    <div style="color:#e0e0e0">${esc(device.hostname)}</div>
   `;
   return el;
 }
