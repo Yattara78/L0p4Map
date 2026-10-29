@@ -54,6 +54,7 @@ class Enricher:
     run: Callable[[str], Any]
     description: str = ""
     match: Optional[Callable[[str], bool]] = None
+    slow: bool = False  # network-heavy: opt-in for batch runs (UI still lists it)
 
     def applies(self, kind: str, value: str) -> bool:
         if kind not in self.kinds or not (value or "").strip():
@@ -81,11 +82,22 @@ def for_value(kind: str, value: str) -> tuple[Enricher, ...]:
     return tuple(e for e in _REGISTRY.values() if e.applies(kind, value))
 
 
-def run_all(kind: str, value: str, only: Optional[list[str]] = None) -> dict[str, Any]:
-    """Run every applicable enricher, returning {key: result}."""
+def run_all(
+    kind: str,
+    value: str,
+    only: Optional[list[str]] = None,
+    include_slow: bool = False,
+) -> dict[str, Any]:
+    """Run applicable enrichers, returning {key: result}.
+
+    Slow ones (HTTP fingerprint, AXFR, Certificate Transparency) are skipped
+    unless `include_slow` or explicitly named in `only`.
+    """
     results: dict[str, Any] = {}
     for enricher in for_value(kind, value):
         if only and enricher.key not in only:
+            continue
+        if enricher.slow and not include_slow and not (only and enricher.key in only):
             continue
         results[enricher.key] = enricher.run(value)
     return results
@@ -133,6 +145,58 @@ def zone_transfer(value: str) -> dict:
         return {"error": str(exc)}
 
 
+TRACKER_PATTERNS = (
+    "google-analytics", "googletagmanager", "gtag/js", "facebook.net",
+    "hotjar", "matomo", "plausible.io", "segment.com", "mixpanel",
+)
+
+
+def http_fingerprint(value: str, opener: Optional[Callable] = None,
+                     timeout: float = 6.0) -> dict:
+    """Grab title / Server / tech hints and trackers from http(s) on 80 and 443."""
+    import re
+    import ssl
+
+    endpoints: list[dict] = []
+    for scheme, port in (("http", 80), ("https", 443)):
+        url = f"{scheme}://{value}/"
+        request = urllib.request.Request(
+            url, headers={"User-Agent": "L0p4Map/1.0"}
+        )
+        kwargs: dict = {"timeout": timeout}
+        if scheme == "https":
+            kwargs["context"] = ssl._create_unverified_context()  # noqa: S323 - LAN appliances
+        try:
+            try:
+                response = (opener or urllib.request.urlopen)(request, **kwargs)
+            except TypeError:  # injected opener with a narrower signature
+                response = (opener or urllib.request.urlopen)(request, timeout=timeout)
+            with response:
+                body = response.read(65536) or b""
+                text = body.decode("utf-8", errors="ignore")
+                headers = dict(response.headers.items())
+                final_url = response.geturl() if hasattr(response, "geturl") else url
+        except Exception as exc:  # noqa: BLE001 - closed port, TLS error, timeout
+            endpoints.append({"url": url, "error": str(exc)})
+            continue
+
+        title_match = re.search(r"<title[^>]*>(.*?)</title>", text, re.I | re.S)
+        generator = re.search(
+            r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']([^"\']+)', text, re.I
+        )
+        endpoints.append({
+            "url": final_url,
+            "status": int(getattr(response, "status", 0) or 0),
+            "server": headers.get("Server", ""),
+            "powered_by": headers.get("X-Powered-By", ""),
+            "title": (title_match.group(1).strip()[:120] if title_match else ""),
+            "generator": generator.group(1) if generator else "",
+            "trackers": sorted({p for p in TRACKER_PATTERNS if p in text.lower()}),
+            "links": len(re.findall(r"<a\s[^>]*href=", text, re.I)),
+        })
+    return {"ip": value, "endpoints": endpoints}
+
+
 def ip_asn(value: str, opener: Optional[Callable] = None) -> dict:
     """Owner/ASN and geolocation for a public IP (ipinfo.io, no key needed)."""
     request = urllib.request.Request(
@@ -164,6 +228,10 @@ def register_builtins() -> None:
         "Nom DNS associé à l'adresse IP", match=is_ip,
     ))
     register(Enricher(
+        "http_fingerprint", "Empreinte web", (IP_KIND,), http_fingerprint,
+        "Titre, serveur, techno et trackers des pages 80/443", match=is_ip, slow=True,
+    ))
+    register(Enricher(
         "ip_asn", "ASN / géolocalisation", (IP_KIND,), ip_asn,
         "Propriétaire du réseau, ville, pays (ipinfo.io)", match=is_public_ip,
     ))
@@ -177,11 +245,11 @@ def register_builtins() -> None:
     ))
     register(Enricher(
         "cert_transparency", "Certificate Transparency", (DOMAIN_KIND,), cert_transparency,
-        "Certificats émis pour le domaine (crt.sh)",
+        "Certificats émis pour le domaine (crt.sh)", slow=True,
     ))
     register(Enricher(
         "zone_transfer", "Transfert de zone (AXFR)", (DOMAIN_KIND,), zone_transfer,
-        "Tente un AXFR sur les serveurs NS — à réserver aux domaines autorisés",
+        "Tente un AXFR sur les serveurs NS — à réserver aux domaines autorisés", slow=True,
     ))
 
 

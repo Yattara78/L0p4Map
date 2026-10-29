@@ -54,7 +54,8 @@ No bloat. No BS. Just raw network intelligence.
 - **Headless CLI** — `./l0p4map.py scan|inventory|label|events|schedule|report`, JSON output, no Qt needed (usable from cron or SSH).
 - **Network toolbox** — subnet calculator, DNS lookup (A/AAAA/MX/NS/TXT), HTTP header check and a quick port probe, from the ⋯ menu or the CLI.
 - **CVE prioritisation** — ranks the CVE list of the Attack Surface page with the FIRST EPSS score and the CISA KEV catalogue, cached locally (12 h / 24 h).
-- **Enrichers** — right-click a device → *Enrichir*: reverse DNS, ASN/geolocation for public IPs, and for hostnames DNS records, WHOIS, Certificate Transparency and an AXFR attempt. Each enricher declares which entity type it handles, so new ones are registered in `core/enrichers.py` without touching the UI.
+- **Enrichers** — right-click a device → *Enrichir*: reverse DNS, ASN/geolocation for public IPs, HTTP fingerprint (title, Server, tech, trackers) and, for hostnames, DNS records, WHOIS, Certificate Transparency and an AXFR attempt. Each enricher declares which entity type it handles, so new ones are registered in `core/enrichers.py` without touching the UI.
+- **Service nodes in the graph** — every open port known for a device is drawn as a small node linked to it, so the topology doubles as an exposure map.
 
 ## 🚧 Upcoming Features
 

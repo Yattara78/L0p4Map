@@ -29,7 +29,7 @@ from core.scanner import (
 from core.validation import InvalidFlags, is_valid_target, sanitize_custom_flags
 from core.inventory import Inventory
 from core.scheduler import Schedule
-from core import alerts, report, risks, toolbox, enrichers
+from core import alerts, report, risks, toolbox, enrichers, graph
 try:
     from core.scanners import (
         tcp_connect_scan, http_probe, get_ssl_info,
@@ -2821,7 +2821,8 @@ class MainWindow(QMainWindow):
         if not self.graph_ready:
             self._pending_graph_data = hosts
             return
-        data = json.dumps(hosts)
+        payload = graph.build_payload(hosts, self.inventory)
+        data = json.dumps(payload)
         data = data.replace("'", "\\'")
         self.graph_view.page().runJavaScript(f"updateGraph('{data}')")
 

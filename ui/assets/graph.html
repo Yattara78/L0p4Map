@@ -259,8 +259,10 @@ const options = {
 
 let network = null;
 
-function updateGraph(devicesJson) {
-  const devices = JSON.parse(devicesJson);
+function updateGraph(payloadJson) {
+  const payload = JSON.parse(payloadJson);
+  const devices = Array.isArray(payload) ? payload : (payload.devices || []);
+  const services = Array.isArray(payload) ? [] : (payload.services || []);
   const nodes = new vis.DataSet();
   const edges = new vis.DataSet();
 
@@ -305,6 +307,39 @@ function updateGraph(devicesJson) {
     });
   });
 
+  // service nodes: one small box per open port, dashed edge to its device
+  const nodeIdByMac = {};
+  devices.forEach((device, index) => {
+    if (device.mac) nodeIdByMac[String(device.mac).toUpperCase()] = index;
+  });
+
+  services.forEach((svc, index) => {
+    const owner = nodeIdByMac[String(svc.mac || "").toUpperCase()];
+    if (owner === undefined) return;
+    const id = "svc-" + index;
+    nodes.add({
+      id,
+      label: String(svc.port),
+      shape: "box",
+      size: 8,
+      color: {
+        background: "#07130d",
+        border: "#0f6b46",
+        highlight: { background: "#0a1f14", border: "#00ff99" },
+        hover: { background: "#07130d", border: "#22aa77" },
+      },
+      font: { color: "#4fe0a0", size: 8 },
+    });
+    edges.add({
+      from: owner,
+      to: id,
+      dashes: [2, 3],
+      width: 1,
+      color: { color: "#123a2a", highlight: "#00ff99" },
+      arrows: { to: { enabled: true, scaleFactor: 0.3 } },
+    });
+  });
+
   if (gatewayId !== null) {
     edges.add({
       from: gatewayId,
@@ -328,7 +363,11 @@ function updateGraph(devicesJson) {
     });
   }
 
-  document.getElementById("counter").textContent = `// ${devices.length} device${devices.length !== 1 ? "s" : ""}`;
+  const svcText = services.length
+    ? ` · ${services.length} service${services.length !== 1 ? "s" : ""}`
+    : "";
+  document.getElementById("counter").textContent =
+    `// ${devices.length} device${devices.length !== 1 ? "s" : ""}${svcText}`;
 
   const container = document.getElementById("graph");
   if (network) network.destroy();

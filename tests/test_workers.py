@@ -74,8 +74,8 @@ def test_device_enrichers_private_ip(qt_app):
     from ui.app import MainWindow
 
     pairs = MainWindow._device_enrichers({"ip": "192.168.1.10", "hostname": "mac-mini"})
-    assert {enricher.key for enricher, _ in pairs} == {"reverse_dns"}
-    assert pairs[0][1] == "192.168.1.10"
+    assert {enricher.key for enricher, _ in pairs} == {"reverse_dns", "http_fingerprint"}
+    assert all(value == "192.168.1.10" for _, value in pairs)
 
 
 def test_device_enrichers_public_ip_with_domain(qt_app):

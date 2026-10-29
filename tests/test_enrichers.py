@@ -31,14 +31,21 @@ def test_predicates():
     assert not enrichers.looks_like_domain("")
 
 
-def test_private_ip_gets_reverse_dns_only():
+def test_private_ip_gets_reverse_dns_and_fingerprint():
     keys = {e.key for e in enrichers.for_value("ip", "192.168.1.10")}
-    assert keys == {"reverse_dns"}
+    assert keys == {"reverse_dns", "http_fingerprint"}
 
 
 def test_public_ip_gets_asn_enricher():
     keys = {e.key for e in enrichers.for_value("ip", "8.8.8.8")}
-    assert keys == {"reverse_dns", "ip_asn"}
+    assert keys == {"reverse_dns", "http_fingerprint", "ip_asn"}
+
+
+def test_slow_enrichers_are_opt_in():
+    fast = enrichers.run_all("ip", "192.168.1.10", only=["reverse_dns"])
+    assert set(fast) == {"reverse_dns"}
+    assert enrichers.get("http_fingerprint").slow is True
+    assert enrichers.get("whois").slow is False
 
 
 def test_domain_gets_four_enrichers():
@@ -55,8 +62,70 @@ def test_registry_lookup():
     assert enrichers.get("whois") is not None
     assert enrichers.get("does-not-exist") is None
     assert {e.key for e in enrichers.all_enrichers()} >= {
-        "reverse_dns", "ip_asn", "dns", "whois", "cert_transparency", "zone_transfer"
+        "reverse_dns", "ip_asn", "dns", "whois", "cert_transparency", "zone_transfer",
+        "http_fingerprint",
     }
+
+
+class FakeHTTPResponse:
+    def __init__(self, body: bytes, headers=None, status=200, url="http://10.0.0.9/"):
+        self._body = body
+        self.headers = headers or {}
+        self.status = status
+        self._url = url
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, size=None):
+        return self._body
+
+    def geturl(self):
+        return self._url
+
+
+CAMERA_HTML = (
+    b"<html><head><title>Camera IP</title>"
+    b"<meta name='generator' content='Hikvision'>"
+    b"<script src='https://www.google-analytics.com/ga.js'></script>"
+    b"</head><body><a href='/a'>a</a><a href='/b'>b</a></body></html>"
+)
+
+
+def test_http_fingerprint_parses_page():
+    def opener(request, timeout=None, context=None):
+        if request.full_url.startswith("http://"):
+            return FakeHTTPResponse(
+                CAMERA_HTML, {"Server": "nginx", "X-Powered-By": "PHP/8.1"}
+            )
+        raise OSError("connection refused")
+
+    data = enrichers.http_fingerprint("10.0.0.9", opener=opener)
+    endpoint = data["endpoints"][0]
+    assert endpoint["title"] == "Camera IP"
+    assert endpoint["server"] == "nginx"
+    assert endpoint["powered_by"] == "PHP/8.1"
+    assert endpoint["generator"] == "Hikvision"
+    assert "google-analytics" in endpoint["trackers"]
+    assert endpoint["links"] == 2
+    assert "connection refused" in data["endpoints"][1]["error"]
+
+
+def test_http_fingerprint_survives_both_ports_closed():
+    def opener(request, timeout=None, context=None):
+        raise TimeoutError("timed out")
+
+    data = enrichers.http_fingerprint("10.0.0.9", opener=opener)
+    assert len(data["endpoints"]) == 2
+    assert all("timed out" in ep["error"] for ep in data["endpoints"])
+
+
+def test_http_fingerprint_registered_for_ips():
+    keys = {e.key for e in enrichers.for_value("ip", "192.168.1.10")}
+    assert "http_fingerprint" in keys
 
 
 def test_ip_asn_parses_ipinfo_payload():
