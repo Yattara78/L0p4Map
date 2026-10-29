@@ -267,7 +267,16 @@ def cmd_enrich(args: argparse.Namespace) -> int:
         print(f"aucun enrichissement pour {value!r} (type {kind})", file=sys.stderr)
         return EXIT_ERROR
 
-    selected = [e for e in applicable if not args.only or e.key in args.only]
+    selected = [
+        enricher
+        for enricher in applicable
+        if (not args.only or enricher.key in args.only)
+        and (
+            args.all
+            or not enricher.slow
+            or (args.only and enricher.key in args.only)
+        )
+    ]
     if not selected:
         print("aucun enrichissement ne correspond à --only", file=sys.stderr)
         return EXIT_ERROR
@@ -384,6 +393,8 @@ def build_parser() -> argparse.ArgumentParser:
     enrich_cmd.add_argument("value")
     enrich_cmd.add_argument("--kind", choices=["ip", "domain"], help="type forcé")
     enrich_cmd.add_argument("--only", action="append", help="enricher précis (répétable)")
+    enrich_cmd.add_argument("--all", action="store_true",
+                            help="inclure les enrichers lents (empreinte web, AXFR, CT)")
     enrich_cmd.add_argument("--json", action="store_true")
     enrich_cmd.set_defaults(func=cmd_enrich)
 
