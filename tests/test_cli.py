@@ -96,3 +96,24 @@ def test_scan_refuses_without_raw_sockets(tmp_path, capsys, monkeypatch):
 def test_unknown_command_fails():
     with pytest.raises(SystemExit):
         l0p4map.main(["nope"])
+
+
+def test_enrich_reverse_dns_on_loopback(tmp_path, capsys):
+    code = l0p4map.main(
+        ["enrich", "127.0.0.1", "--kind", "ip", "--only", "reverse_dns", "--json"]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["reverse_dns"]["ip"] == "127.0.0.1"
+
+
+def test_enrich_private_ip_skips_asn(tmp_path, capsys):
+    code = l0p4map.main(["enrich", "192.168.1.10", "--kind", "ip", "--json"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert list(payload) == ["reverse_dns"]
+
+
+def test_enrich_unknown_kind_fails(tmp_path, capsys):
+    code = l0p4map.main(["enrich", "mac-mini", "--kind", "ip"])
+    assert code == 2

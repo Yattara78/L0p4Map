@@ -68,3 +68,20 @@ def test_traffic_worker_batches_packets(qt_app):
     assert len(batches) == 1
     assert len(batches[0]) == 3
     assert worker._buffer == []
+
+
+def test_device_enrichers_private_ip(qt_app):
+    from ui.app import MainWindow
+
+    pairs = MainWindow._device_enrichers({"ip": "192.168.1.10", "hostname": "mac-mini"})
+    assert {enricher.key for enricher, _ in pairs} == {"reverse_dns"}
+    assert pairs[0][1] == "192.168.1.10"
+
+
+def test_device_enrichers_public_ip_with_domain(qt_app):
+    from ui.app import MainWindow
+
+    pairs = MainWindow._device_enrichers({"ip": "8.8.8.8", "hostname": "dns.google"})
+    keys = {enricher.key for enricher, _ in pairs}
+    assert {"reverse_dns", "ip_asn", "dns", "whois"} <= keys
+    assert all(value in ("8.8.8.8", "dns.google") for _, value in pairs)

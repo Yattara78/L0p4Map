@@ -54,6 +54,7 @@ No bloat. No BS. Just raw network intelligence.
 - **Headless CLI** — `./l0p4map.py scan|inventory|label|events|schedule|report`, JSON output, no Qt needed (usable from cron or SSH).
 - **Network toolbox** — subnet calculator, DNS lookup (A/AAAA/MX/NS/TXT), HTTP header check and a quick port probe, from the ⋯ menu or the CLI.
 - **CVE prioritisation** — ranks the CVE list of the Attack Surface page with the FIRST EPSS score and the CISA KEV catalogue, cached locally (12 h / 24 h).
+- **Enrichers** — right-click a device → *Enrichir*: reverse DNS, ASN/geolocation for public IPs, and for hostnames DNS records, WHOIS, Certificate Transparency and an AXFR attempt. Each enricher declares which entity type it handles, so new ones are registered in `core/enrichers.py` without touching the UI.
 
 ## 🚧 Upcoming Features
 
@@ -136,6 +137,8 @@ No Qt, no GUI — useful from cron, a jump host or a mini-PC:
 ./l0p4map.py dns github.com                  # A/AAAA/MX/NS/TXT
 ./l0p4map.py headers https://github.com      # status + headers
 ./l0p4map.py priority --cve CVE-2019-0708:9.8 --cve CVE-2017-0144:8.1
+./l0p4map.py enrich 8.8.8.8                    # reverse DNS + ASN/geo
+./l0p4map.py enrich example.com --json         # DNS, WHOIS, CT, AXFR
 ```
 
 Alerts and schedule live in `~/.l0p4map/config.json` (mode 600); the inventory is
