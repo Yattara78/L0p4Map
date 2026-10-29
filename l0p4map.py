@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from core import alerts, report, risks, settings  # noqa: E402
+from core import alerts, report, risks, settings, enrichers  # noqa: E402
 from core import toolbox  # noqa: E402
 from core.inventory import DEFAULT_DB_PATH, Inventory  # noqa: E402
 from core.scheduler import Schedule  # noqa: E402
@@ -259,6 +259,36 @@ def cmd_priority(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_enrich(args: argparse.Namespace) -> int:
+    value = args.value.strip()
+    kind = args.kind or ("ip" if enrichers.is_ip(value) else "domain")
+    applicable = enrichers.for_value(kind, value)
+    if not applicable:
+        print(f"aucun enrichissement pour {value!r} (type {kind})", file=sys.stderr)
+        return EXIT_ERROR
+
+    selected = [e for e in applicable if not args.only or e.key in args.only]
+    if not selected:
+        print("aucun enrichissement ne correspond à --only", file=sys.stderr)
+        return EXIT_ERROR
+
+    results: dict[str, object] = {}
+    for enricher in selected:
+        print(f"… {enricher.key}", file=sys.stderr)
+        results[enricher.key] = enricher.run(value)
+
+    if args.json:
+        print(json.dumps(results, indent=2, ensure_ascii=False, default=str))
+        return EXIT_OK
+    for key, result in results.items():
+        print(f"\n== {key} ==")
+        if isinstance(result, str):
+            print(result)
+        else:
+            print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+    return EXIT_OK
+
+
 def cmd_schedule(args: argparse.Namespace) -> int:
     schedule = Schedule.load()
     if args.every:
@@ -349,6 +379,13 @@ def build_parser() -> argparse.ArgumentParser:
     prio.add_argument("--from-json", help="fichier JSON [{id, cvss, host}]")
     prio.add_argument("--json", action="store_true")
     prio.set_defaults(func=cmd_priority)
+
+    enrich_cmd = sub.add_parser("enrich", help="enrichir une IP ou un domaine")
+    enrich_cmd.add_argument("value")
+    enrich_cmd.add_argument("--kind", choices=["ip", "domain"], help="type forcé")
+    enrich_cmd.add_argument("--only", action="append", help="enricher précis (répétable)")
+    enrich_cmd.add_argument("--json", action="store_true")
+    enrich_cmd.set_defaults(func=cmd_enrich)
 
     sched = sub.add_parser("schedule", help="planifier les scans")
     sched.add_argument("--every", type=int, metavar="MIN", help="toutes les N minutes")

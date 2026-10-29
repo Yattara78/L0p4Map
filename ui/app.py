@@ -29,7 +29,7 @@ from core.scanner import (
 from core.validation import InvalidFlags, is_valid_target, sanitize_custom_flags
 from core.inventory import Inventory
 from core.scheduler import Schedule
-from core import alerts, report, risks, toolbox
+from core import alerts, report, risks, toolbox, enrichers
 try:
     from core.scanners import (
         tcp_connect_scan, http_probe, get_ssl_info,
@@ -169,6 +169,26 @@ class ActionWorker(QThread):
             proc.wait(timeout=3)
         except Exception:
             pass
+
+
+class FuncWorker(QThread):
+    """Runs any callable off the GUI thread (enrichers hit the network)."""
+
+    done = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, func, *args):
+        super().__init__()
+        self.func = func
+        self.args = args
+
+    def run(self):
+        try:
+            result = self.func(*self.args)
+        except Exception as exc:  # noqa: BLE001 - reported to the UI
+            self.failed.emit(str(exc))
+            return
+        self.done.emit(result)
 
 
 class ScanWorker(QThread):
@@ -2094,23 +2114,42 @@ class MainWindow(QMainWindow):
 
         if item is None:
             return
-        
+
         row = item.row()
-        ip = self.table.item(row,0).text()
+        ip = self.table.item(row, 0).text()
+        device = self._device_for_row(row)
 
-        menu = QMenu()
+        menu = QMenu(self)
 
-        portScan_action = QAction("Send to port scan", self)
-        ta_action = QAction("Send to Traffic Analyzer", self)
-        as_action = QAction("Send to Attack Surface", self)
+        # page shortcuts: navigation, not enrichment
+        shortcuts = [
+            ("Send to port scan", 1, lambda: self.scan_target.setText(ip)),
+            ("Send to Attack Surface", 3, lambda: self.as_target.setText(ip)),
+            ("Send to Traffic Analyzer", 4, lambda: self.ta_filter.setText(ip)),
+        ]
+        for label, index, prepare in shortcuts:
+            action = QAction(label, self)
+            action.triggered.connect(
+                lambda _=False, i=index, p=prepare: (
+                    self.stack.setCurrentIndex(i), p(), self._set_active_nav(i)
+                )
+            )
+            menu.addAction(action)
 
-        portScan_action.triggered.connect(lambda: (self.stack.setCurrentIndex(1), self.scan_target.setText(ip), self._set_active_nav(1)))
-        ta_action.triggered.connect(lambda: (self.stack.setCurrentIndex(4), self.ta_filter.setText(ip), self._set_active_nav(4)))
-        as_action.triggered.connect(lambda: (self.stack.setCurrentIndex(3), self.as_target.setText(ip), self._set_active_nav(3)))
-
-        menu.addAction(portScan_action)
-        menu.addAction(as_action)
-        menu.addAction(ta_action)
+        menu.addSeparator()
+        enrich_menu = menu.addMenu("Enrichir")
+        candidates = self._device_enrichers(device)
+        if candidates:
+            for enricher, value in candidates:
+                action = QAction(f"{enricher.label} — {value}", self)
+                action.setToolTip(enricher.description)
+                action.triggered.connect(
+                    lambda _=False, e=enricher, v=value: self._run_enricher(e, v)
+                )
+                enrich_menu.addAction(action)
+        else:
+            empty = enrich_menu.addAction("aucun enrichissement disponible")
+            empty.setEnabled(False)
 
         meta_action = QAction("Étiqueter / grouper…", self)
         meta_action.triggered.connect(
@@ -2120,6 +2159,77 @@ class MainWindow(QMainWindow):
         menu.addAction(meta_action)
 
         menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _device_for_row(self, row: int) -> dict:
+        """Device dict for a table row, from the inventory when possible."""
+        def cell(column: int) -> str:
+            item = self.table.item(row, column)
+            return item.text() if item else ""
+
+        mac = cell(1)
+        device = self.inventory.get(mac) if mac else None
+        if device:
+            return device
+        return {
+            "ip": cell(0), "mac": mac, "vendor": cell(2), "hostname": cell(3),
+        }
+
+    @staticmethod
+    def _device_enrichers(device: dict) -> list:
+        """(enricher, value) pairs applicable to this device."""
+        candidates: list = []
+        seen: set[str] = set()
+
+        ip = (device.get("ip") or "").strip()
+        if ip:
+            for enricher in enrichers.for_value(enrichers.IP_KIND, ip):
+                candidates.append((enricher, ip))
+                seen.add(enricher.key)
+
+        hostname = (device.get("hostname") or "").strip()
+        if enrichers.looks_like_domain(hostname):
+            for enricher in enrichers.for_value(enrichers.DOMAIN_KIND, hostname):
+                if enricher.key not in seen:
+                    candidates.append((enricher, hostname))
+        return candidates
+
+    def _run_enricher(self, enricher, value: str):
+        self.statusBar().showMessage(f"{enricher.label} sur {value}…")
+        worker = FuncWorker(enricher.run, value)
+        self._enricher_worker = worker
+        worker.done.connect(
+            lambda result, e=enricher, v=value: self._show_enricher_result(e, v, result)
+        )
+        worker.failed.connect(
+            lambda message: QMessageBox.warning(self, "Enrichissement", message)
+        )
+        worker.start()
+
+    def _show_enricher_result(self, enricher, value: str, result):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"{enricher.label} — {value}")
+        dialog.resize(680, 480)
+        layout = QVBoxLayout(dialog)
+
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setStyleSheet(
+            "font-family: 'JetBrains Mono', monospace; font-size: 11px;"
+        )
+        if isinstance(result, str):
+            text.setPlainText(result)
+        else:
+            text.setPlainText(json.dumps(result, indent=2, ensure_ascii=False))
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+
+        layout.addWidget(QLabel(enricher.description))
+        layout.addWidget(text, stretch=1)
+        layout.addWidget(buttons)
+        self.statusBar().showMessage(f"{enricher.label} terminé — {value}", 6000)
+        dialog.exec()
 
 
     def _build_detail_panel(self):
